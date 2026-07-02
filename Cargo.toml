@@ -1,0 +1,10 @@
+# Cargo.toml
+
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/agent-cli",
+    "crates/agent-core",
+    "crates/provider",
+]
