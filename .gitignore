@@ -2,6 +2,7 @@
 .env
 /.llvm-cov/
 /lcov.info
+/docs/TOOL_DESIGN.md
 .omx/
 /.idea/
 <<<<<<< HEAD
