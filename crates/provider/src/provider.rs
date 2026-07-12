@@ -4,9 +4,91 @@ use std::pin::Pin;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
+    pub role: ChatRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: None,
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_delta: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChatEvent {
+    TextChunk(String),
+    ToolCallDelta(ToolCallDelta),
+    ToolCallDone(ToolCall),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,6 +139,7 @@ pub struct ChatOptions {
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolSpec>,
     pub options: ChatOptions,
 }
 
@@ -70,6 +153,12 @@ pub enum ProviderError {
 
     #[error("failed to parse responses: {0}")]
     Parse(String),
+
+    #[error("provider stream did not complete successfully: {0}")]
+    StreamIncomplete(String),
+
+    #[error("unsupported provider feature: {0}")]
+    Unsupported(String),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -91,13 +180,11 @@ impl FromStr for ApiType {
 }
 
 /// A boxed stream keeps provider implementations hidden behind the trait boundary.
-/// Errors can happen either while creating the stream or while consuming it.
-pub type ChatStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+/// Each item is a structured event so providers can stream text and tool activity.
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatEvent, ProviderError>> + Send>>;
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
-    /// Fails before returning the stream for setup errors, then yields per-chunk errors
-    /// for failures that happen after streaming has started.
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, ProviderError>;
 }
 
