@@ -277,20 +277,6 @@ impl Agent {
         })
         .to_string()
     }
-
-    pub fn push_assistant_message(&mut self, content: impl Into<String>) {
-        self.history.push(Message::assistant(content));
-    }
-
-    pub fn discard_pending_user_message(&mut self) {
-        if matches!(self.history.last(), Some(Message::User(_))) {
-            self.history.pop();
-        }
-    }
-
-    pub fn clear_history(&mut self) {
-        self.history.clear();
-    }
 }
 
 fn message_to_chat_message(message: &Message) -> ChatMessage {

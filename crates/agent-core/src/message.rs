@@ -15,10 +15,6 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::System(content.into())
-    }
-
     pub fn user(content: impl Into<String>) -> Self {
         Self::User(content.into())
     }
