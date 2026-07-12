@@ -120,7 +120,10 @@ mod tests {
     }
 
     fn assert_message(message: &Message, role: Role, content: &str) {
-        assert_eq!(std::mem::discriminant(&message.role), std::mem::discriminant(&role));
+        assert_eq!(
+            std::mem::discriminant(&message.role),
+            std::mem::discriminant(&role)
+        );
         assert_eq!(message.content, content);
     }
 
