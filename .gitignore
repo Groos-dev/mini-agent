@@ -2,3 +2,5 @@
 .env
 .omx/
 /.idea/
+/.llvm-cov/
+/lcov.info
