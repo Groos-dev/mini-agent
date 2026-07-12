@@ -33,15 +33,6 @@ impl ChatMessage {
         }
     }
 
-    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: ChatRole::Assistant,
-            content: None,
-            tool_calls,
-            tool_call_id: None,
-        }
-    }
-
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::Tool,
