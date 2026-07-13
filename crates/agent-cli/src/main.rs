@@ -1,18 +1,18 @@
 use std::{
-    io::{self, Write},
+    io::{self, BufRead, Write},
     str::FromStr,
-    sync::Arc,
 };
 
 use agent_core::{
     agent::{Agent, AgentEvent, AgentRunOptions},
     tool::{
-        ToolApproval, ToolRegistry,
+        ToolRegistry,
         shell::{ShellTool, ShellToolConfig},
     },
 };
+use agent_protocol::{ModelOptions, ReasoningEffort};
 use futures::StreamExt;
-use provider::{ApiType, ChatOptions, OpenAIProvider, ReasoningEffort};
+use openai_provider::{ApiType, OpenAIProvider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,16 +34,16 @@ async fn main() -> anyhow::Result<()> {
     print_welcome();
 
     let stdin = io::stdin();
+    let mut stdin = stdin.lock();
 
     loop {
         print!("\nYou> ");
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
+        let Some(input) = read_input_line(&mut stdin)? else {
             println!();
             break;
-        }
+        };
 
         let input = input.trim();
         if input.is_empty() {
@@ -53,8 +53,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        let mut options = session_options.agent_run_options();
-        options.tool_approval = Some(build_tool_approval());
+        let options = session_options.agent_run_options();
         let mut stream = match agent.run_stream(input, options).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -119,19 +118,27 @@ impl SessionOptions {
         }
     }
 
-    fn chat_options(&self) -> ChatOptions {
-        ChatOptions {
+    fn model_options(&self) -> ModelOptions {
+        ModelOptions {
             reasoning_effort: self.reasoning_effort,
         }
     }
 
     fn agent_run_options(&self) -> AgentRunOptions {
-        AgentRunOptions::from_chat_options(self.chat_options())
+        AgentRunOptions::from_model_options(self.model_options())
     }
 }
 
 fn load_config() -> Config {
     load_config_from_env(|key| std::env::var(key).ok())
+}
+
+fn read_input_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if input.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn load_config_from_env<F>(get: F) -> Config
@@ -163,19 +170,9 @@ where
     }
 }
 
-fn build_tool_approval() -> ToolApproval {
-    Arc::new(|name, input| {
-        print!("\nApprove tool {name} with arguments {input}? [y/N] ");
-        let _ = io::stdout().flush();
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).is_ok()
-            && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    })
-}
-
 fn build_tool_registry() -> anyhow::Result<ToolRegistry> {
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(ShellTool::new(ShellToolConfig::default())))?;
+    registry.register(Box::new(ShellTool::new(ShellToolConfig::default())))?;
     Ok(registry)
 }
 
@@ -193,9 +190,20 @@ fn print_welcome() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Cursor};
 
     use super::*;
+
+    #[test]
+    fn read_input_line_replaces_invalid_utf8_without_failing() {
+        let mut input = Cursor::new(b"hello\xFF\n".to_vec());
+
+        assert_eq!(
+            read_input_line(&mut input).unwrap(),
+            Some("hello\u{FFFD}\n".to_string())
+        );
+        assert_eq!(read_input_line(&mut input).unwrap(), None);
+    }
 
     fn config_from(values: &[(&str, &str)]) -> Config {
         let env: HashMap<&str, &str> = values.iter().copied().collect();
@@ -295,13 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_options_returns_provider_chat_options() {
+    fn model_options_preserve_reasoning_effort() {
         let options = SessionOptions {
             reasoning_effort: Some(ReasoningEffort::XHigh),
         };
 
         assert_eq!(
-            options.chat_options().reasoning_effort,
+            options.model_options().reasoning_effort,
             Some(ReasoningEffort::XHigh)
         );
     }

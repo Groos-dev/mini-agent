@@ -1,15 +1,14 @@
+use agent_protocol::{
+    Message, ModelEvent, ModelOptions, ModelProvider, ModelRequest, ModelStream, ToolCall,
+};
 use async_stream::stream;
 use futures::StreamExt;
-use provider::{
-    ChatEvent, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStream, Provider, ToolCall,
-};
 use std::pin::Pin;
 use tracing::{debug, info, warn};
 
 use crate::{
     error::CoreError,
-    message::Message,
-    tool::{ToolApproval, ToolError, ToolExecutionContext, ToolRegistry, ToolResult},
+    tool::{ToolExecutionContext, ToolRegistry, ToolResult},
 };
 
 pub type AgentEventStream<'a> =
@@ -38,40 +37,32 @@ pub enum AgentEvent {
 
 #[derive(Clone)]
 pub struct AgentRunOptions {
-    pub chat_options: ChatOptions,
+    pub model_options: ModelOptions,
     pub tool_context: ToolExecutionContext,
-    pub max_tool_rounds: usize,
-    pub tool_approval: Option<ToolApproval>,
 }
 
 impl AgentRunOptions {
-    pub fn from_chat_options(chat_options: ChatOptions) -> Self {
+    pub fn from_model_options(model_options: ModelOptions) -> Self {
         Self {
-            chat_options,
+            model_options,
             tool_context: ToolExecutionContext::default(),
-            max_tool_rounds: 8,
-            tool_approval: None,
         }
     }
 }
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    provider: Box<dyn ModelProvider>,
     history: Vec<Message>,
     tool_registry: ToolRegistry,
 }
 
 impl Agent {
-    pub fn new(provider: Box<dyn Provider>, tool_registry: ToolRegistry) -> Self {
+    pub fn new(provider: Box<dyn ModelProvider>, tool_registry: ToolRegistry) -> Self {
         Self {
             provider,
             history: Vec::new(),
             tool_registry,
         }
-    }
-
-    fn build_request_from_messages(messages: &[Message]) -> Vec<ChatMessage> {
-        messages.iter().map(message_to_chat_message).collect()
     }
 
     pub async fn run_stream(
@@ -80,20 +71,15 @@ impl Agent {
         options: AgentRunOptions,
     ) -> Result<AgentEventStream<'_>, CoreError> {
         let user_input = user_input.into();
-        let mut working_history = self.history.clone();
-        working_history.push(Message::user(user_input));
-        let registered_tool_count = self.tool_registry.specs().len();
+        self.history.push(Message::user(user_input));
 
         let s = stream! {
-            let mut completed_tool_rounds = 0;
             loop {
                 debug!(
-                    completed_tool_rounds,
-                    history_messages = working_history.len(),
-                    registered_tool_count,
+                    history_messages = self.history.len(),
                     "requesting model turn"
                 );
-                let mut provider_stream = match self.run_turn_once(&working_history, &options).await {
+                let mut provider_stream = match self.run_turn_once(&self.history, &options).await {
                     Ok(stream) => stream,
                     Err(err) => {
                         warn!(error = %err, "failed to start model stream");
@@ -102,58 +88,43 @@ impl Agent {
                     }
                 };
 
-                let mut assistant_text = String::new();
                 let mut tool_calls = Vec::new();
                 while let Some(event) = provider_stream.next().await {
                     match event {
-                        Ok(ChatEvent::TextChunk(text)) => {
-                            assistant_text.push_str(&text);
+                        Ok(ModelEvent::AssistantTextDelta(text)) => {
                             yield Ok(AgentEvent::TextChunk(text));
                         }
-                        Ok(ChatEvent::ToolCallDone(tool_call)) => {
+                        Ok(ModelEvent::AssistantMessageDone(content)) => {
+                            self.history.push(Message::assistant_text(content));
+                        }
+                        Ok(ModelEvent::ToolCallRequestReady(tool_call)) => {
+                            self.history
+                                .push(Message::tool_call(tool_call.clone()));
                             tool_calls.push(tool_call);
                         }
-                        Ok(ChatEvent::ToolCallDelta(_)) => {
+                        Ok(ModelEvent::ToolCallDelta(_)) => {
                             // TODO: 如果需要实时展示 tool call 参数增量，可在这里转换为 AgentEvent。
                         }
+                        Ok(ModelEvent::ResponseCompleted) => {}
                         Err(err) => {
                             warn!(error = %err, "model stream failed");
-                            yield Err(CoreError::Provider(err));
+                            yield Err(CoreError::Model(err));
                             return;
                         }
                     }
                 }
 
-                self.record_assistant_message(
-                    &mut working_history,
-                    (!assistant_text.is_empty()).then_some(assistant_text),
-                    &tool_calls,
-                );
-
                 if tool_calls.is_empty() {
-                    self.history = working_history;
-                    debug!(history_messages = self.history.len(), "agent turn completed");
+                    let history_messages = self.history.len();
+                    debug!(history_messages, "agent turn completed");
                     yield Ok(AgentEvent::TurnFinished);
                     return;
                 }
 
-                completed_tool_rounds += 1;
                 info!(
-                    completed_tool_rounds,
                     tool_call_count = tool_calls.len(),
                     "received tool calls"
                 );
-                if completed_tool_rounds > options.max_tool_rounds {
-                    warn!(
-                        completed_tool_rounds,
-                        max_tool_rounds = options.max_tool_rounds,
-                        "tool-call round limit exceeded"
-                    );
-                    yield Err(CoreError::ToolCallLimitExceeded {
-                        limit: options.max_tool_rounds,
-                    });
-                    return;
-                }
 
                 for tool_call in tool_calls {
                     info!(
@@ -175,7 +146,7 @@ impl Agent {
                                 success = result.success,
                                 "tool call completed"
                             );
-                            working_history.push(Message::tool_result(
+                            self.history.push(Message::tool_result(
                                 tool_call.id.clone(),
                                 self.format_tool_result(&result),
                             ));
@@ -193,7 +164,7 @@ impl Agent {
                                 error = %error,
                                 "tool call failed"
                             );
-                            working_history.push(Message::tool_result(
+                            self.history.push(Message::tool_result(
                                 tool_call.id.clone(),
                                 self.format_tool_error(&error),
                             ));
@@ -215,29 +186,13 @@ impl Agent {
         &self,
         messages: &[Message],
         options: &AgentRunOptions,
-    ) -> Result<ChatStream, CoreError> {
-        let request = ChatRequest {
-            messages: Self::build_request_from_messages(messages),
+    ) -> Result<ModelStream, CoreError> {
+        let request = ModelRequest {
+            messages: messages.to_vec(),
             tools: self.tool_registry.specs(),
-            options: options.chat_options.clone(),
+            options: options.model_options,
         };
-        Ok(self.provider.chat_stream(request).await?)
-    }
-
-    fn record_assistant_message(
-        &self,
-        working_history: &mut Vec<Message>,
-        assistant_text: Option<String>,
-        tool_calls: &[ToolCall],
-    ) {
-        if !tool_calls.is_empty() {
-            working_history.push(Message::assistant_response(
-                assistant_text,
-                tool_calls.to_vec(),
-            ));
-        } else if let Some(assistant_text) = assistant_text {
-            working_history.push(Message::assistant(assistant_text));
-        }
+        Ok(self.provider.stream(request).await?)
     }
 
     async fn execute_tool_call(
@@ -245,25 +200,16 @@ impl Agent {
         tool_call: &ToolCall,
         options: &AgentRunOptions,
     ) -> Result<ToolResult, CoreError> {
-        let input = self.parse_tool_arguments(tool_call)?;
-        if let Some(approval) = &options.tool_approval
-            && !approval(&tool_call.name, &input)
-        {
-            return Err(CoreError::Tool(ToolError::Denied(
-                "tool call was not approved by the user".to_string(),
-            )));
-        }
+        let input = serde_json::from_str(&tool_call.arguments).map_err(|err| {
+            CoreError::InvalidToolArguments {
+                tool_name: tool_call.name.clone(),
+                message: err.to_string(),
+            }
+        })?;
         Ok(self
             .tool_registry
-            .execute(&tool_call.name, input, options.tool_context.clone())
+            .execute(&tool_call.name, input, &options.tool_context)
             .await?)
-    }
-
-    fn parse_tool_arguments(&self, tool_call: &ToolCall) -> Result<serde_json::Value, CoreError> {
-        serde_json::from_str(&tool_call.arguments).map_err(|err| CoreError::InvalidToolArguments {
-            tool_name: tool_call.name.clone(),
-            message: err.to_string(),
-        })
     }
 
     fn format_tool_result(&self, result: &ToolResult) -> String {
@@ -277,40 +223,6 @@ impl Agent {
         })
         .to_string()
     }
-
-    pub fn push_assistant_message(&mut self, content: impl Into<String>) {
-        self.history.push(Message::assistant(content));
-    }
-
-    pub fn discard_pending_user_message(&mut self) {
-        if matches!(self.history.last(), Some(Message::User(_))) {
-            self.history.pop();
-        }
-    }
-
-    pub fn clear_history(&mut self) {
-        self.history.clear();
-    }
-}
-
-fn message_to_chat_message(message: &Message) -> ChatMessage {
-    match message {
-        Message::System(content) => ChatMessage::text(ChatRole::System, content),
-        Message::User(content) => ChatMessage::text(ChatRole::User, content),
-        Message::Assistant {
-            content,
-            tool_calls,
-        } => ChatMessage {
-            role: ChatRole::Assistant,
-            content: content.clone(),
-            tool_calls: tool_calls.clone(),
-            tool_call_id: None,
-        },
-        Message::ToolResult {
-            tool_call_id,
-            content,
-        } => ChatMessage::tool_result(tool_call_id, content),
-    }
 }
 
 #[cfg(test)]
@@ -320,19 +232,19 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use agent_protocol::{ModelError, ToolSpec};
     use async_trait::async_trait;
     use futures::{StreamExt, stream};
-    use provider::{ProviderError, ToolSpec};
 
     use super::*;
     use crate::tool::{ToolError, ToolExecutor};
 
-    type FakeEvents = Vec<Result<ChatEvent, ProviderError>>;
+    type FakeEvents = Vec<Result<ModelEvent, ModelError>>;
     type FakeResponseQueue = VecDeque<FakeEvents>;
 
     #[derive(Clone)]
     struct FakeProvider {
-        requests: Arc<Mutex<Vec<ChatRequest>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
         responses: Arc<Mutex<FakeResponseQueue>>,
     }
 
@@ -346,8 +258,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for FakeProvider {
-        async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, ProviderError> {
+    impl ModelProvider for FakeProvider {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
             self.requests.lock().unwrap().push(request);
             let events = self
                 .responses
@@ -374,7 +286,7 @@ mod tests {
         async fn execute(
             &self,
             input: serde_json::Value,
-            _ctx: ToolExecutionContext,
+            _ctx: &ToolExecutionContext,
         ) -> Result<ToolResult, ToolError> {
             Ok(ToolResult::success(input.to_string()))
         }
@@ -391,7 +303,7 @@ mod tests {
     fn agent_with_responses(responses: Vec<FakeEvents>) -> (Agent, FakeProvider) {
         let provider = FakeProvider::new(responses);
         let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(EchoTool)).unwrap();
+        tools.register(Box::new(EchoTool)).unwrap();
         (Agent::new(Box::new(provider.clone()), tools), provider)
     }
 
@@ -399,16 +311,22 @@ mod tests {
     async fn run_stream_executes_a_tool_and_preserves_assistant_text_and_history() {
         let (mut agent, provider) = agent_with_responses(vec![
             vec![
-                Ok(ChatEvent::TextChunk("Checking. ".to_string())),
-                Ok(ChatEvent::ToolCallDone(tool_call())),
+                Ok(ModelEvent::AssistantTextDelta("Checking. ".to_string())),
+                Ok(ModelEvent::AssistantMessageDone("Checking. ".to_string())),
+                Ok(ModelEvent::ToolCallRequestReady(tool_call())),
+                Ok(ModelEvent::ResponseCompleted),
             ],
-            vec![Ok(ChatEvent::TextChunk("Done.".to_string()))],
+            vec![
+                Ok(ModelEvent::AssistantTextDelta("Done.".to_string())),
+                Ok(ModelEvent::AssistantMessageDone("Done.".to_string())),
+                Ok(ModelEvent::ResponseCompleted),
+            ],
         ]);
 
         let events = agent
             .run_stream(
                 "check",
-                AgentRunOptions::from_chat_options(ChatOptions::default()),
+                AgentRunOptions::from_model_options(ModelOptions::default()),
             )
             .await
             .unwrap()
@@ -425,28 +343,33 @@ mod tests {
         )));
         assert!(matches!(events.last(), Some(Ok(AgentEvent::TurnFinished))));
 
-        assert_eq!(agent.history.len(), 4);
+        assert_eq!(agent.history.len(), 5);
         assert!(matches!(
             &agent.history[1],
-            Message::Assistant { content: Some(content), tool_calls }
-                if content == "Checking. " && tool_calls[0].id == "call_1"
+            Message::AssistantText(content) if content == "Checking. "
         ));
-        assert!(matches!(agent.history[2], Message::ToolResult { .. }));
         assert!(matches!(
-            &agent.history[3],
-            Message::Assistant { content: Some(content), tool_calls }
-                if content == "Done." && tool_calls.is_empty()
+            &agent.history[2],
+            Message::ToolCall(tool_call) if tool_call.id == "call_1"
+        ));
+        assert!(matches!(agent.history[3], Message::ToolResult { .. }));
+        assert!(matches!(
+            &agent.history[4],
+            Message::AssistantText(content) if content == "Done."
         ));
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tools[0].name, "echo");
-        assert_eq!(requests[1].messages.len(), 3);
-        assert_eq!(
-            requests[1].messages[1].content.as_deref(),
-            Some("Checking. ")
-        );
-        assert_eq!(requests[1].messages[1].tool_calls[0].id, "call_1");
+        assert_eq!(requests[1].messages.len(), 4);
+        assert!(matches!(
+            &requests[1].messages[1],
+            Message::AssistantText(content) if content == "Checking. "
+        ));
+        assert!(matches!(
+            &requests[1].messages[2],
+            Message::ToolCall(tool_call) if tool_call.id == "call_1"
+        ));
     }
 
     #[tokio::test]
@@ -456,14 +379,21 @@ mod tests {
             ..tool_call()
         };
         let (mut agent, _) = agent_with_responses(vec![
-            vec![Ok(ChatEvent::ToolCallDone(invalid_call))],
-            vec![Ok(ChatEvent::TextChunk("Recovered.".to_string()))],
+            vec![
+                Ok(ModelEvent::ToolCallRequestReady(invalid_call)),
+                Ok(ModelEvent::ResponseCompleted),
+            ],
+            vec![
+                Ok(ModelEvent::AssistantTextDelta("Recovered.".to_string())),
+                Ok(ModelEvent::AssistantMessageDone("Recovered.".to_string())),
+                Ok(ModelEvent::ResponseCompleted),
+            ],
         ]);
 
         let events = agent
             .run_stream(
                 "check",
-                AgentRunOptions::from_chat_options(ChatOptions::default()),
+                AgentRunOptions::from_model_options(ModelOptions::default()),
             )
             .await
             .unwrap()
@@ -478,53 +408,5 @@ mod tests {
             &agent.history[2],
             Message::ToolResult { content, .. } if content.contains("invalid tool arguments")
         ));
-    }
-
-    #[tokio::test]
-    async fn run_stream_does_not_execute_unapproved_tool_calls() {
-        let (mut agent, _provider) = agent_with_responses(vec![
-            vec![Ok(ChatEvent::ToolCallDone(tool_call()))],
-            vec![Ok(ChatEvent::TextChunk("Denied.".to_string()))],
-        ]);
-        let mut options = AgentRunOptions::from_chat_options(ChatOptions::default());
-        options.tool_approval = Some(Arc::new(|_, _| false));
-
-        let events = agent
-            .run_stream("check", options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Ok(AgentEvent::ToolCallFailed { error, .. })
-                if error.contains("not approved by the user")
-        )));
-    }
-
-    #[tokio::test]
-    async fn run_stream_enforces_the_tool_round_limit_without_committing_history() {
-        let (mut agent, _) = agent_with_responses(vec![
-            vec![Ok(ChatEvent::ToolCallDone(tool_call()))],
-            vec![Ok(ChatEvent::ToolCallDone(tool_call()))],
-        ]);
-        let options = AgentRunOptions {
-            max_tool_rounds: 1,
-            ..AgentRunOptions::from_chat_options(ChatOptions::default())
-        };
-
-        let events = agent
-            .run_stream("check", options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
-
-        assert!(matches!(
-            events.last(),
-            Some(Err(CoreError::ToolCallLimitExceeded { limit: 1 }))
-        ));
-        assert!(agent.history.is_empty());
     }
 }

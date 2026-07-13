@@ -7,10 +7,11 @@ name = "agent-cli"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-protocol",
  "anyhow",
  "dotenvy",
  "futures",
- "provider",
+ "openai-provider",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -20,10 +21,10 @@ dependencies = [
 name = "agent-core"
 version = "0.1.0"
 dependencies = [
+ "agent-protocol",
  "async-stream",
  "async-trait",
  "futures",
- "provider",
  "rustix",
  "serde",
  "serde_json",
@@ -31,6 +32,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -779,6 +791,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openai-provider"
+version = "0.1.0"
+dependencies = [
+ "agent-protocol",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -878,22 +907,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "provider"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "wiremock",
 ]
 
 [[package]]

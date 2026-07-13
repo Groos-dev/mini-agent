@@ -1,11 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use provider::ToolSpec;
+use agent_protocol::ToolSpec;
 use serde::{Deserialize, Serialize};
 
 pub mod shell;
-
-pub type ToolApproval = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
@@ -81,13 +79,18 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(
         &self,
         input: serde_json::Value,
-        ctx: ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError>;
 }
 
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<dyn ToolExecutor>>,
+    tools: BTreeMap<String, RegisteredTool>,
+}
+
+struct RegisteredTool {
+    executor: Box<dyn ToolExecutor>,
+    spec: ToolSpec,
 }
 
 impl ToolRegistry {
@@ -95,7 +98,7 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, tool: Arc<dyn ToolExecutor>) -> Result<(), ToolError> {
+    pub fn register(&mut self, tool: Box<dyn ToolExecutor>) -> Result<(), ToolError> {
         let spec = tool.spec();
         if self.tools.contains_key(&spec.name) {
             return Err(ToolError::InvalidInput(format!(
@@ -103,33 +106,37 @@ impl ToolRegistry {
                 spec.name
             )));
         }
-        self.tools.insert(spec.name, tool);
+        self.tools.insert(
+            spec.name.clone(),
+            RegisteredTool {
+                executor: tool,
+                spec,
+            },
+        );
         Ok(())
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|tool| tool.spec()).collect()
+        self.tools.values().map(|tool| tool.spec.clone()).collect()
     }
 
     pub async fn execute(
         &self,
         name: &str,
         input: serde_json::Value,
-        ctx: ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
-        tool.execute(input, ctx).await
+        tool.executor.execute(input, ctx).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use provider::ToolSpec;
+    use agent_protocol::ToolSpec;
 
     use super::*;
 
@@ -148,7 +155,7 @@ mod tests {
         async fn execute(
             &self,
             _input: serde_json::Value,
-            _ctx: ToolExecutionContext,
+            _ctx: &ToolExecutionContext,
         ) -> Result<ToolResult, ToolError> {
             Ok(ToolResult::success("ok"))
         }
@@ -157,16 +164,16 @@ mod tests {
     #[tokio::test]
     async fn registry_rejects_duplicate_names_and_reports_unknown_tools() {
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(TestTool)).unwrap();
+        registry.register(Box::new(TestTool)).unwrap();
 
-        let duplicate = registry.register(Arc::new(TestTool)).unwrap_err();
+        let duplicate = registry.register(Box::new(TestTool)).unwrap_err();
         assert!(matches!(duplicate, ToolError::InvalidInput(_)));
 
         let missing = registry
             .execute(
                 "missing",
                 serde_json::json!({}),
-                ToolExecutionContext::default(),
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();

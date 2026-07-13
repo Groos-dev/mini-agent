@@ -4,14 +4,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
 
-use crate::{
-    ChatEvent, ChatMessage, ChatRole, ChatStream, FinishReason, ProviderError, ReasoningEffort,
-    ToolCall, ToolCallDelta, ToolSpec,
+use agent_protocol::{
+    Message, ModelError, ModelEvent, ModelStream, ReasoningEffort, ToolCall, ToolCallDelta,
+    ToolSpec,
 };
 
 use super::OpenAIProvider;
 
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Other,
+}
 
 #[derive(Serialize)]
 struct CompletionsRequest {
@@ -135,7 +144,7 @@ impl ToolCallAccumulator {
         }
     }
 
-    fn finish(self) -> Result<Vec<ToolCall>, ProviderError> {
+    fn finish(self) -> Result<Vec<ToolCall>, ModelError> {
         let mut indexed = self.by_index.into_iter().collect::<Vec<_>>();
         indexed.sort_by_key(|(index, _)| *index);
         indexed
@@ -146,12 +155,12 @@ impl ToolCallAccumulator {
 }
 
 impl PartialToolCall {
-    fn finish(self, index: usize) -> Result<ToolCall, ProviderError> {
+    fn finish(self, index: usize) -> Result<ToolCall, ModelError> {
         let id = self.id.ok_or_else(|| {
-            ProviderError::StreamIncomplete(format!("tool call at index {index} is missing an id"))
+            ModelError::StreamIncomplete(format!("tool call at index {index} is missing an id"))
         })?;
         let name = self.name.ok_or_else(|| {
-            ProviderError::StreamIncomplete(format!("tool call at index {index} is missing a name"))
+            ModelError::StreamIncomplete(format!("tool call at index {index} is missing a name"))
         })?;
         Ok(ToolCall {
             id,
@@ -164,10 +173,10 @@ impl PartialToolCall {
 impl OpenAIProvider {
     pub(super) async fn chat_stream_completions(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         tools: Vec<ToolSpec>,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<ChatStream, ProviderError> {
+    ) -> Result<ModelStream, ModelError> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = CompletionsRequest {
             model: self.model.clone(),
@@ -183,12 +192,16 @@ impl OpenAIProvider {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|err| ModelError::Transport(err.to_string()))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(ProviderError::Api {
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| ModelError::Transport(err.to_string()))?;
+            return Err(ModelError::Api {
                 status: status.as_u16(),
                 message: text,
             });
@@ -198,6 +211,7 @@ impl OpenAIProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut utf8_pending = Vec::new();
             let mut buf = String::new();
+            let mut assistant_text = String::new();
             let mut tool_calls = ToolCallAccumulator::default();
             let mut message_completed = false;
             let mut raw_response = Vec::new();
@@ -207,7 +221,7 @@ impl OpenAIProvider {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
                     Err(_) => {
-                        yield Err(ProviderError::StreamIncomplete(
+                        yield Err(ModelError::StreamIncomplete(
                             "Chat Completions stream idle timeout".to_string(),
                         ));
                         return;
@@ -215,7 +229,7 @@ impl OpenAIProvider {
                 };
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(e) => { yield Err(ProviderError::Http(e)); return; }
+                    Err(err) => { yield Err(ModelError::Transport(err.to_string())); return; }
                 };
                 match decode_utf8_chunk(&mut utf8_pending, &chunk) {
                     Ok(text) => buf.push_str(&text),
@@ -232,7 +246,7 @@ impl OpenAIProvider {
                                 debug!(provider = "openai_chat_completions", response = %raw_response.join("\n"), "provider stream completed");
                                 return;
                             }
-                            yield Err(ProviderError::StreamIncomplete(
+                            yield Err(ModelError::StreamIncomplete(
                                 "Chat Completions ended before a finish reason".to_string(),
                             ));
                             return;
@@ -242,23 +256,29 @@ impl OpenAIProvider {
                             Ok(parsed) => {
                                 for choice in parsed.choices {
                                     if let Some(content) = choice.delta.content {
-                                        yield Ok(ChatEvent::TextChunk(content));
+                                        assistant_text.push_str(&content);
+                                        yield Ok(ModelEvent::AssistantTextDelta(content));
                                     }
 
                                     for tool_delta in choice.delta.tool_calls {
                                         let event_delta = tool_calls.push_delta(tool_delta);
-                                        yield Ok(ChatEvent::ToolCallDelta(event_delta));
+                                        yield Ok(ModelEvent::ToolCallDelta(event_delta));
                                     }
 
                                     if let Some(reason) = choice.finish_reason {
                                         let finish_reason = map_finish_reason(&reason);
                                         match finish_reason {
                                             FinishReason::Stop | FinishReason::ToolCalls => {
+                                                if !assistant_text.is_empty() {
+                                                    yield Ok(ModelEvent::AssistantMessageDone(
+                                                        std::mem::take(&mut assistant_text),
+                                                    ));
+                                                }
                                                 if finish_reason == FinishReason::ToolCalls {
                                                     match std::mem::take(&mut tool_calls).finish() {
                                                         Ok(finished_tool_calls) => {
                                                             for tool_call in finished_tool_calls {
-                                                                yield Ok(ChatEvent::ToolCallDone(tool_call));
+                                                                yield Ok(ModelEvent::ToolCallRequestReady(tool_call));
                                                             }
                                                         }
                                                         Err(err) => {
@@ -267,10 +287,11 @@ impl OpenAIProvider {
                                                         }
                                                     }
                                                 }
+                                                yield Ok(ModelEvent::ResponseCompleted);
                                                 message_completed = true;
                                             }
                                             FinishReason::Length | FinishReason::ContentFilter | FinishReason::Other => {
-                                                yield Err(ProviderError::StreamIncomplete(format!(
+                                                yield Err(ModelError::StreamIncomplete(format!(
                                                     "Chat Completions finished with {reason}"
                                                 )));
                                                 return;
@@ -280,7 +301,7 @@ impl OpenAIProvider {
                                 }
                             }
                             Err(err) => {
-                                yield Err(ProviderError::Parse(err.to_string()));
+                                yield Err(ModelError::Parse(err.to_string()));
                                 return;
                             }
                         }
@@ -289,7 +310,7 @@ impl OpenAIProvider {
             }
 
             if !message_completed {
-                yield Err(ProviderError::StreamIncomplete(
+                yield Err(ModelError::StreamIncomplete(
                     "Chat Completions ended before a finish reason".to_string(),
                 ));
             } else {
@@ -300,24 +321,42 @@ impl OpenAIProvider {
     }
 }
 
-impl From<ChatMessage> for OpenAIChatMessage {
-    fn from(message: ChatMessage) -> Self {
-        let role = match message.role {
-            ChatRole::System => "system",
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-            ChatRole::Tool => "tool",
-        };
-
-        Self {
-            role,
-            content: message.content,
-            tool_calls: message
-                .tool_calls
-                .into_iter()
-                .map(OpenAIToolCall::from)
-                .collect(),
-            tool_call_id: message.tool_call_id,
+impl From<Message> for OpenAIChatMessage {
+    fn from(message: Message) -> Self {
+        match message {
+            Message::System(content) => Self {
+                role: "system",
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message::User(content) => Self {
+                role: "user",
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message::AssistantText(content) => Self {
+                role: "assistant",
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message::ToolCall(tool_call) => Self {
+                role: "assistant",
+                content: None,
+                tool_calls: vec![tool_call.into()],
+                tool_call_id: None,
+            },
+            Message::ToolResult {
+                tool_call_id,
+                content,
+            } => Self {
+                role: "tool",
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call_id),
+            },
         }
     }
 }
@@ -358,7 +397,7 @@ fn map_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
-fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, ProviderError> {
+fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, ModelError> {
     pending.extend_from_slice(chunk);
     match std::str::from_utf8(pending) {
         Ok(text) => {
@@ -369,11 +408,11 @@ fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, Prov
         Err(err) if err.error_len().is_none() => {
             let valid_up_to = err.valid_up_to();
             let text = String::from_utf8(pending[..valid_up_to].to_vec())
-                .map_err(|err| ProviderError::Parse(err.to_string()))?;
+                .map_err(|err| ModelError::Parse(err.to_string()))?;
             pending.drain(..valid_up_to);
             Ok(text)
         }
-        Err(err) => Err(ProviderError::Parse(format!(
+        Err(err) => Err(ModelError::Parse(format!(
             "invalid UTF-8 in SSE stream: {err}"
         ))),
     }
@@ -397,8 +436,8 @@ mod tests {
         )
     }
 
-    fn messages() -> Vec<ChatMessage> {
-        vec![ChatMessage::text(ChatRole::User, "hello")]
+    fn messages() -> Vec<Message> {
+        vec![Message::user("hello")]
     }
 
     fn shell_spec() -> ToolSpec {
@@ -416,7 +455,7 @@ mod tests {
         }
     }
 
-    async fn collect_events(stream: ChatStream) -> Vec<ChatEvent> {
+    async fn collect_events(stream: ModelStream) -> Vec<ModelEvent> {
         stream
             .collect::<Vec<_>>()
             .await
@@ -458,13 +497,43 @@ data: [DONE]
         let calls = events
             .into_iter()
             .filter_map(|event| match event {
-                ChatEvent::ToolCallDone(call) => Some(call),
+                ModelEvent::ToolCallRequestReady(call) => Some(call),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[1].id, "call_2");
+    }
+
+    #[tokio::test]
+    async fn completions_stream_emits_common_message_and_completion_events() {
+        let server = mock_completions(
+            r#"data: {"choices":[{"delta":{"content":"Done."}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = collect_events(
+            provider(server.uri())
+                .chat_stream_completions(messages(), Vec::new(), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ModelEvent::AssistantTextDelta(text),
+                ModelEvent::AssistantMessageDone(message),
+                ModelEvent::ResponseCompleted,
+            ] if text == "Done." && message == "Done."
+        ));
     }
 
     #[tokio::test]
@@ -487,8 +556,7 @@ data: [DONE]
             .await;
 
         assert!(match events.last() {
-            Some(Err(ProviderError::StreamIncomplete(message))) =>
-                message.contains("missing an id"),
+            Some(Err(ModelError::StreamIncomplete(message))) => message.contains("missing an id"),
             _ => false,
         });
     }
@@ -508,17 +576,13 @@ data: [DONE]
         )
         .await;
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: Some("Checking".to_string()),
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "shell".to_string(),
-                    arguments: r#"{"command":"pwd"}"#.to_string(),
-                }],
-                tool_call_id: None,
-            },
-            ChatMessage::tool_result("call_1", "output"),
+            Message::assistant_text("Checking"),
+            Message::tool_call(ToolCall {
+                id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }),
+            Message::tool_result("call_1", "output"),
         ];
 
         let stream = provider(server.uri())
@@ -533,9 +597,9 @@ data: [DONE]
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "shell");
         assert_eq!(body["messages"][0]["content"], "Checking");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(body["messages"][1]["role"], "tool");
-        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
     }
 
     #[tokio::test]
@@ -553,7 +617,7 @@ data: [DONE]
             .await;
 
         assert!(match events.last() {
-            Some(Err(ProviderError::StreamIncomplete(message))) => {
+            Some(Err(ModelError::StreamIncomplete(message))) => {
                 message.contains("finish reason")
             }
             _ => false,

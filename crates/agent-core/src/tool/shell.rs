@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use provider::ToolSpec;
+use agent_protocol::ToolSpec;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -204,12 +204,14 @@ impl ShellTool {
     async fn run_shell(
         &self,
         input: ShellInput,
-        ctx: ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
-        let prepared = self.prepare_command(input, &ctx)?;
-        let command = prepared.command.clone();
-        let cwd = prepared.cwd.clone();
-        let timeout = prepared.timeout;
+        let prepared = self.prepare_command(input, ctx)?;
+        let PreparedShellCommand {
+            command,
+            cwd,
+            timeout,
+        } = prepared;
         debug!(
             cwd = %cwd.display(),
             timeout_ms = timeout.as_millis(),
@@ -327,7 +329,7 @@ impl ToolExecutor for ShellTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        ctx: ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let input = Self::parse_input(input)?;
         self.run_shell(input, ctx).await
@@ -454,7 +456,7 @@ mod tests {
         let result = tool
             .execute(
                 json!({"command": "test -z \"${OPENAI_API_KEY:-}\""}),
-                context(root.path().to_path_buf()),
+                &context(root.path().to_path_buf()),
             )
             .await
             .unwrap();
@@ -473,7 +475,7 @@ mod tests {
         let result = tool
             .execute(
                 json!({"command": "cargo --version"}),
-                context(root.path().to_path_buf()),
+                &context(root.path().to_path_buf()),
             )
             .await
             .unwrap();
@@ -494,7 +496,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(json!({"command": "yes x | head -c 128"}), limited_context)
+            .execute(json!({"command": "yes x | head -c 128"}), &limited_context)
             .await
             .unwrap();
         assert_eq!(result.metadata["stdout_truncated"], true);
@@ -506,7 +508,7 @@ mod tests {
                     "command": format!("(sleep 2; touch {}) &", marker.display()),
                     "timeout_ms": 1000,
                 }),
-                context(root.path().to_path_buf()),
+                &context(root.path().to_path_buf()),
             )
             .await
             .unwrap_err();

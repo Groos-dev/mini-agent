@@ -2,9 +2,27 @@ mod completions;
 mod responses;
 
 use reqwest::Client;
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
-use crate::{ChatRequest, ChatStream, Provider, ProviderError, provider::ApiType};
+use agent_protocol::{ModelError, ModelProvider, ModelRequest, ModelStream};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ApiType {
+    Responses,
+    Completions,
+}
+
+impl FromStr for ApiType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "responses" => Ok(Self::Responses),
+            "completions" => Ok(Self::Completions),
+            _ => Err(format!("unknown API type: {s}")),
+        }
+    }
+}
 
 pub struct OpenAIProvider {
     pub(crate) api_key: String,
@@ -15,8 +33,8 @@ pub struct OpenAIProvider {
 }
 
 #[async_trait::async_trait]
-impl Provider for OpenAIProvider {
-    async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, ProviderError> {
+impl ModelProvider for OpenAIProvider {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
         match self.api_type {
             ApiType::Completions => {
                 self.chat_stream_completions(
@@ -65,11 +83,11 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn request() -> ChatRequest {
-        ChatRequest {
-            messages: vec![crate::ChatMessage::text(crate::ChatRole::User, "hello")],
+    fn request() -> ModelRequest {
+        ModelRequest {
+            messages: vec![agent_protocol::Message::user("hello")],
             tools: Vec::new(),
-            options: crate::ChatOptions::default(),
+            options: agent_protocol::ModelOptions::default(),
         }
     }
 
@@ -106,14 +124,14 @@ data: [DONE]
             .await;
 
         let stream = provider(server.uri(), ApiType::Completions)
-            .chat_stream(request())
+            .stream(request())
             .await
             .unwrap();
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
 
         assert!(matches!(
             chunks.first(),
-            Some(Ok(crate::ChatEvent::TextChunk(text))) if text == "ok"
+            Some(Ok(agent_protocol::ModelEvent::AssistantTextDelta(text))) if text == "ok"
         ));
     }
 
@@ -123,7 +141,7 @@ data: [DONE]
         Mock::given(method("POST"))
             .and(path("/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"data: {"type":"response.output_text.delta","delta":"ok"}
+                r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}
 
 data: {"type":"response.completed"}
 
@@ -135,14 +153,14 @@ data: [DONE]
             .await;
 
         let stream = provider(server.uri(), ApiType::Responses)
-            .chat_stream(request())
+            .stream(request())
             .await
             .unwrap();
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
 
         assert!(matches!(
             chunks.first(),
-            Some(Ok(crate::ChatEvent::TextChunk(text))) if text == "ok"
+            Some(Ok(agent_protocol::ModelEvent::AssistantTextDelta(text))) if text == "ok"
         ));
     }
 }
