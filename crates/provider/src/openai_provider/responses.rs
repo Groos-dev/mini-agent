@@ -2,12 +2,12 @@ use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
 
-use crate::{
-    ChatEvent, ChatMessage, ChatRole, ChatStream, ProviderError, ReasoningEffort, ToolCall,
-    ToolCallDelta, ToolSpec,
+use agent_protocol::{
+    Message, ModelError, ModelEvent, ModelStream, ReasoningEffort, ToolCall, ToolCallDelta,
+    ToolSpec,
 };
 
 use super::OpenAIProvider;
@@ -54,6 +54,8 @@ struct ResponsesStreamEvent {
     #[serde(default)]
     arguments: Option<String>,
     #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
     item: Option<ResponsesOutputItem>,
 }
 
@@ -67,15 +69,25 @@ struct ResponsesOutputItem {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContentPart>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 impl OpenAIProvider {
     pub(super) async fn chat_stream_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         tools: Vec<ToolSpec>,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<ChatStream, ProviderError> {
+    ) -> Result<ModelStream, ModelError> {
         let url = format!("{}/responses", self.base_url);
         let body = ResponsesRequest {
             model: self.model.clone(),
@@ -91,12 +103,16 @@ impl OpenAIProvider {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|err| ModelError::Transport(err.to_string()))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(ProviderError::Api {
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| ModelError::Transport(err.to_string()))?;
+            return Err(ModelError::Api {
                 status: status.as_u16(),
                 message: text,
             });
@@ -106,8 +122,9 @@ impl OpenAIProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut utf8_pending = Vec::new();
             let mut buf = String::new();
-            let mut completed_tool_call_ids = HashSet::new();
-            let mut completed_arguments_by_index = HashMap::new();
+            let mut arguments_by_output_index = HashMap::new();
+            let mut text_by_output_index = HashMap::new();
+            let mut tool_call_output_indexes = HashMap::new();
             let mut message_completed = false;
             let mut raw_response = Vec::new();
 
@@ -116,7 +133,7 @@ impl OpenAIProvider {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
                     Err(_) => {
-                        yield Err(ProviderError::StreamIncomplete(
+                        yield Err(ModelError::StreamIncomplete(
                             "Responses stream idle timeout".to_string(),
                         ));
                         return;
@@ -124,7 +141,7 @@ impl OpenAIProvider {
                 };
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(e) => { yield Err(ProviderError::Http(e)); return; }
+                    Err(err) => { yield Err(ModelError::Transport(err.to_string())); return; }
                 };
                 match decode_utf8_chunk(&mut utf8_pending, &chunk) {
                     Ok(text) => buf.push_str(&text),
@@ -143,7 +160,7 @@ impl OpenAIProvider {
                             debug!(provider = "openai_responses", response = %raw_response.join("\n"), "provider stream completed");
                             return;
                         }
-                        yield Err(ProviderError::StreamIncomplete(
+                        yield Err(ModelError::StreamIncomplete(
                             "Responses ended before response.completed".to_string(),
                         ));
                         return;
@@ -154,34 +171,70 @@ impl OpenAIProvider {
                     let event = match serde_json::from_str::<ResponsesStreamEvent>(data) {
                         Ok(event) => event,
                         Err(err) => {
-                            yield Err(ProviderError::Parse(err.to_string()));
+                            yield Err(ModelError::Parse(err.to_string()));
                             return;
                         }
                     };
 
                     match event.event_type.as_str() {
                         "response.output_text.delta" => {
+                            let output_index = match required_output_index(&event) {
+                                Ok(index) => index,
+                                Err(err) => { yield Err(err); return; }
+                            };
                             if let Some(delta) = event.delta {
-                                yield Ok(ChatEvent::TextChunk(delta));
+                                text_by_output_index
+                                    .entry(output_index)
+                                    .or_insert_with(String::new)
+                                    .push_str(&delta);
+                                yield Ok(ModelEvent::AssistantTextDelta(delta));
                             }
                         }
                         "response.function_call_arguments.delta" => {
-                            yield Ok(ChatEvent::ToolCallDelta(ToolCallDelta {
-                                index: event.output_index.unwrap_or_default(),
+                            let index = match required_output_index(&event) {
+                                Ok(index) => index,
+                                Err(err) => { yield Err(err); return; }
+                            };
+                            if let Some(delta) = &event.delta {
+                                arguments_by_output_index
+                                    .entry(index)
+                                    .or_insert_with(String::new)
+                                    .push_str(delta);
+                            }
+                            yield Ok(ModelEvent::ToolCallDelta(ToolCallDelta {
+                                index,
                                 id: event.call_id,
                                 name: event.name,
                                 arguments_delta: event.delta,
                             }));
                         }
                         "response.function_call_arguments.done" => {
-                            if let (Some(index), Some(arguments)) = (event.output_index, event.arguments) {
-                                completed_arguments_by_index.insert(index, arguments);
+                            let index = match required_output_index(&event) {
+                                Ok(index) => index,
+                                Err(err) => { yield Err(err); return; }
+                            };
+                            if let Some(arguments) = event.arguments {
+                                arguments_by_output_index.insert(index, arguments);
+                            }
+                        }
+                        "response.output_text.done" => {
+                            let index = match required_output_index(&event) {
+                                Ok(index) => index,
+                                Err(err) => { yield Err(err); return; }
+                            };
+                            if let Some(text) = event.text {
+                                text_by_output_index.insert(index, text);
                             }
                         }
                         "response.output_item.done" => {
-                            match complete_tool_call(event, &completed_arguments_by_index) {
-                                Ok(Some(tool_call)) if completed_tool_call_ids.insert(tool_call.id.clone()) => {
-                                    yield Ok(ChatEvent::ToolCallDone(tool_call));
+                            match complete_output_item(
+                                event,
+                                &mut arguments_by_output_index,
+                                &mut text_by_output_index,
+                                &mut tool_call_output_indexes,
+                            ) {
+                                Ok(Some(event)) => {
+                                    yield Ok(event);
                                 }
                                 Ok(_) => {}
                                 Err(err) => {
@@ -192,9 +245,10 @@ impl OpenAIProvider {
                         }
                         "response.completed" => {
                             message_completed = true;
+                            yield Ok(ModelEvent::ResponseCompleted);
                         }
                         "response.failed" | "response.incomplete" => {
-                            yield Err(ProviderError::StreamIncomplete(format!(
+                            yield Err(ModelError::StreamIncomplete(format!(
                                 "Responses emitted {}",
                                 event.event_type
                             )));
@@ -206,7 +260,7 @@ impl OpenAIProvider {
             }
 
             if !message_completed {
-                yield Err(ProviderError::StreamIncomplete(
+                yield Err(ModelError::StreamIncomplete(
                     "Responses ended before response.completed".to_string(),
                 ));
             } else {
@@ -228,25 +282,56 @@ impl From<ToolSpec> for ResponsesFunctionTool {
     }
 }
 
-fn complete_tool_call(
-    event: ResponsesStreamEvent,
-    cached_arguments: &HashMap<usize, String>,
-) -> Result<Option<ToolCall>, ProviderError> {
-    let output_index = event.output_index;
-    if let Some(item) = event.item {
-        if item.item_type != "function_call" {
-            return Ok(None);
-        }
-        let arguments = item
-            .arguments
-            .or_else(|| output_index.and_then(|index| cached_arguments.get(&index).cloned()));
-        return required_tool_call(item.call_id, item.name, arguments).map(Some);
-    }
-
-    Ok(None)
+fn required_output_index(event: &ResponsesStreamEvent) -> Result<usize, ModelError> {
+    event.output_index.ok_or_else(|| {
+        ModelError::StreamIncomplete(format!("{} is missing output_index", event.event_type))
+    })
 }
 
-fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, ProviderError> {
+fn complete_output_item(
+    event: ResponsesStreamEvent,
+    arguments_by_output_index: &mut HashMap<usize, String>,
+    text_by_output_index: &mut HashMap<usize, String>,
+    tool_call_output_indexes: &mut HashMap<String, usize>,
+) -> Result<Option<ModelEvent>, ModelError> {
+    let output_index = required_output_index(&event)?;
+    let item = event.item.ok_or_else(|| {
+        ModelError::StreamIncomplete("response.output_item.done is missing item".to_string())
+    })?;
+
+    match item.item_type.as_str() {
+        "function_call" => {
+            let cached_arguments = arguments_by_output_index.remove(&output_index);
+            let arguments = item.arguments.or(cached_arguments);
+            let tool_call = required_tool_call(item.call_id, item.name, arguments)?;
+            if let Some(existing_index) = tool_call_output_indexes.get(&tool_call.id) {
+                if *existing_index != output_index {
+                    return Err(ModelError::Parse(format!(
+                        "function call {} was emitted for output indexes {existing_index} and {output_index}",
+                        tool_call.id
+                    )));
+                }
+                return Ok(None);
+            }
+            tool_call_output_indexes.insert(tool_call.id.clone(), output_index);
+            Ok(Some(ModelEvent::ToolCallRequestReady(tool_call)))
+        }
+        "message" => {
+            let cached_text = text_by_output_index.remove(&output_index);
+            let content = item
+                .content
+                .into_iter()
+                .filter(|part| part.part_type == "output_text")
+                .filter_map(|part| part.text)
+                .collect::<String>();
+            let content = (!content.is_empty()).then_some(content).or(cached_text);
+            Ok(content.map(ModelEvent::AssistantMessageDone))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, ModelError> {
     pending.extend_from_slice(chunk);
     match std::str::from_utf8(pending) {
         Ok(text) => {
@@ -257,11 +342,11 @@ fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<String, Prov
         Err(err) if err.error_len().is_none() => {
             let valid_up_to = err.valid_up_to();
             let text = String::from_utf8(pending[..valid_up_to].to_vec())
-                .map_err(|err| ProviderError::Parse(err.to_string()))?;
+                .map_err(|err| ModelError::Parse(err.to_string()))?;
             pending.drain(..valid_up_to);
             Ok(text)
         }
-        Err(err) => Err(ProviderError::Parse(format!(
+        Err(err) => Err(ModelError::Parse(format!(
             "invalid UTF-8 in SSE stream: {err}"
         ))),
     }
@@ -271,15 +356,14 @@ fn required_tool_call(
     id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
-) -> Result<ToolCall, ProviderError> {
+) -> Result<ToolCall, ModelError> {
     let id = id.ok_or_else(|| {
-        ProviderError::StreamIncomplete("function call is missing call_id".to_string())
+        ModelError::StreamIncomplete("function call is missing call_id".to_string())
     })?;
-    let name = name.ok_or_else(|| {
-        ProviderError::StreamIncomplete("function call is missing name".to_string())
-    })?;
+    let name = name
+        .ok_or_else(|| ModelError::StreamIncomplete("function call is missing name".to_string()))?;
     let arguments = arguments.ok_or_else(|| {
-        ProviderError::StreamIncomplete("function call is missing arguments".to_string())
+        ModelError::StreamIncomplete("function call is missing arguments".to_string())
     })?;
 
     Ok(ToolCall {
@@ -289,37 +373,33 @@ fn required_tool_call(
     })
 }
 
-fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
+fn messages_to_input(messages: &[Message]) -> Vec<Value> {
     let mut input = Vec::new();
 
     for message in messages {
-        match message.role {
-            ChatRole::System | ChatRole::User | ChatRole::Assistant => {
-                if let Some(content) = &message.content {
-                    let role = match message.role {
-                        ChatRole::System => "system",
-                        ChatRole::User => "user",
-                        ChatRole::Assistant => "assistant",
-                        ChatRole::Tool => unreachable!("tool messages use function_call_output"),
-                    };
-                    input.push(json!({ "role": role, "content": content }));
-                }
-
-                if matches!(message.role, ChatRole::Assistant) {
-                    input.extend(message.tool_calls.iter().map(|tool_call| {
-                        json!({
-                            "type": "function_call",
-                            "call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "arguments": tool_call.arguments,
-                        })
-                    }));
-                }
+        match message {
+            Message::System(content) => {
+                input.push(json!({ "role": "system", "content": content }));
             }
-            ChatRole::Tool => input.push(json!({
+            Message::User(content) => {
+                input.push(json!({ "role": "user", "content": content }));
+            }
+            Message::AssistantText(content) => {
+                input.push(json!({ "role": "assistant", "content": content }));
+            }
+            Message::ToolCall(tool_call) => input.push(json!({
+                "type": "function_call",
+                "call_id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            })),
+            Message::ToolResult {
+                tool_call_id,
+                content,
+            } => input.push(json!({
                 "type": "function_call_output",
-                "call_id": message.tool_call_id,
-                "output": message.content,
+                "call_id": tool_call_id,
+                "output": content,
             })),
         }
     }
@@ -345,11 +425,8 @@ mod tests {
         )
     }
 
-    fn messages() -> Vec<ChatMessage> {
-        vec![
-            ChatMessage::text(ChatRole::System, "be concise"),
-            ChatMessage::text(ChatRole::User, "hello"),
-        ]
+    fn messages() -> Vec<Message> {
+        vec![Message::system("be concise"), Message::user("hello")]
     }
 
     fn shell_spec() -> ToolSpec {
@@ -367,7 +444,7 @@ mod tests {
         }
     }
 
-    async fn collect_events(stream: ChatStream) -> Vec<ChatEvent> {
+    async fn collect_events(stream: ModelStream) -> Vec<ModelEvent> {
         stream
             .collect::<Vec<_>>()
             .await
@@ -389,17 +466,13 @@ mod tests {
     #[test]
     fn messages_to_input_preserves_function_calls_and_outputs() {
         let mut messages = messages();
-        messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: Some("Checking".to_string()),
-            tool_calls: vec![ToolCall {
-                id: "call_1".to_string(),
-                name: "shell".to_string(),
-                arguments: r#"{"command":"pwd"}"#.to_string(),
-            }],
-            tool_call_id: None,
-        });
-        messages.push(ChatMessage::tool_result("call_1", "output"));
+        messages.push(Message::assistant_text("Checking"));
+        messages.push(Message::tool_call(ToolCall {
+            id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+        }));
+        messages.push(Message::tool_result("call_1", "output"));
 
         assert_eq!(
             messages_to_input(&messages),
@@ -425,13 +498,15 @@ mod tests {
     #[tokio::test]
     async fn responses_stream_yields_text_and_complete_function_calls() {
         let server = mock_responses(
-            r#"data: {"type":"response.output_text.delta","delta":"Checking "}
+            r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Checking "}
 
-data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"pwd\"}"}
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"command\":\"pwd\"}"}
 
-data: {"type":"response.function_call_arguments.done","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}
+data: {"type":"response.function_call_arguments.done","output_index":1,"call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}
 
-data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}}
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"Checking "}]}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}}
 
 data: {"type":"response.completed"}
 
@@ -450,21 +525,26 @@ data: [DONE]
 
         assert!(matches!(
             &events[0],
-            ChatEvent::TextChunk(text) if text == "Checking "
+            ModelEvent::AssistantTextDelta(text) if text == "Checking "
         ));
         assert!(matches!(
             &events[1],
-            ChatEvent::ToolCallDelta(delta) if delta.arguments_delta.as_deref() == Some(r#"{"command":"pwd"}"#)
+            ModelEvent::ToolCallDelta(delta) if delta.arguments_delta.as_deref() == Some(r#"{"command":"pwd"}"#)
         ));
         assert!(matches!(
             &events[2],
-            ChatEvent::ToolCallDone(call) if call.id == "call_1" && call.name == "shell"
+            ModelEvent::AssistantMessageDone(text) if text == "Checking "
         ));
-        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[3],
+            ModelEvent::ToolCallRequestReady(call) if call.id == "call_1" && call.name == "shell"
+        ));
+        assert!(matches!(events[4], ModelEvent::ResponseCompleted));
+        assert_eq!(events.len(), 5);
     }
 
     #[tokio::test]
-    async fn responses_stream_rejects_function_calls_missing_required_fields() {
+    async fn responses_stream_rejects_events_missing_output_index() {
         let server = mock_responses(
             r#"data: {"type":"response.function_call_arguments.done","name":"shell","arguments":"{}"}
 
@@ -482,7 +562,10 @@ data: [DONE]
             .collect::<Vec<_>>()
             .await;
 
-        assert!(events.iter().all(Result::is_ok));
+        assert!(matches!(
+            events.last(),
+            Some(Err(ModelError::StreamIncomplete(message))) if message.contains("output_index")
+        ));
     }
 
     #[tokio::test]
@@ -510,10 +593,37 @@ data: [DONE]
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, ChatEvent::ToolCallDone(_)))
+                .filter(|event| matches!(event, ModelEvent::ToolCallRequestReady(_)))
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_rejects_a_call_id_reused_for_another_output_item() {
+        let server = mock_responses(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+
+data: {"type":"response.completed"}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = provider(server.uri())
+            .chat_stream_response(messages(), vec![shell_spec()], None)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.last(),
+            Some(Err(ModelError::Parse(message))) if message.contains("call_1")
+        ));
     }
 
     #[test]
@@ -576,7 +686,7 @@ data: [DONE]
 
         assert!(matches!(
             err,
-            ProviderError::Api {
+            ModelError::Api {
                 status: 401,
                 message
             } if message == "bad key"
@@ -596,7 +706,7 @@ data: [DONE]
             .await;
 
         assert!(match events.last() {
-            Some(Err(ProviderError::StreamIncomplete(message))) => {
+            Some(Err(ModelError::StreamIncomplete(message))) => {
                 message.contains("response.incomplete")
             }
             _ => false,
