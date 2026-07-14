@@ -1,12 +1,12 @@
 # Contributing
 
-This repository is a Rust workspace. The current source of truth for local development is the workspace `Cargo.toml` files and the environment-variable loading logic in `crates/agent-cli/src/main.rs`.
+This repository is a Rust workspace. The current source of truth for local development is the workspace `Cargo.toml` files and the configuration module in `crates/agent-config`.
 
 ## Development Workflow
 
 1. Install a recent Rust toolchain with edition 2024 support.
-2. Create a local `.env` file in the repository root.
-3. Set the required provider variables.
+2. Create `~/.mini-agent/config.toml`.
+3. Set the required provider values in the TOML file.
 4. Run formatting and tests before submitting changes.
 5. Run the CLI manually to verify interactive behavior when touching session or streaming logic.
 
@@ -23,26 +23,31 @@ Because this repository is a Cargo workspace, the main development commands are:
 | `cargo test -p agent-core` | Run agent state and history tests only. |
 | `cargo test -p agent-cli` | Run CLI configuration and session option tests only. |
 
-## Environment Setup
+## Configuration Setup
 
-The CLI reads configuration from process environment variables and supports `.env` through `dotenvy`.
+The CLI reads configuration only from `~/.mini-agent/config.toml`. This task does not add a configuration initialization command; create the file directly.
 
-| Variable | Required | Default | Purpose | Format |
+| TOML key | Required | Default | Purpose | Format |
 | --- | --- | --- | --- | --- |
-| `OPENAI_API_KEY` | Yes | None | Authenticates requests to the configured provider. | Non-empty string |
-| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | Overrides the provider base URL. | Absolute URL without endpoint suffix |
-| `OPENAI_MODEL` | No | `gpt-5.5` | Selects the target model. | Model id string |
-| `OPENAI_API_TYPE` | No | `completions` | Selects which streaming API contract to use. | `completions` or `responses` |
-| `OPENAI_REASONING_EFFORT` | No | Empty | Enables provider reasoning effort when supported. | `low`, `medium`, `high`, or `xhigh` |
+| `provider.openai.api_key` | Yes | None | Authenticates requests to the configured provider. | Non-empty string |
+| `provider.openai.base_url` | No | `https://api.openai.com/v1` | Overrides the provider base URL. | Absolute HTTP(S) URL without endpoint suffix |
+| `provider.openai.model` | No | `gpt-5.5` | Selects the target model. | Model id string |
+| `provider.openai.api_type` | No | `completions` | Selects which streaming API contract to use. | `completions` or `responses` |
+| `provider.openai.reasoning_effort` | No | None | Enables provider reasoning effort when supported. | `low`, `medium`, `high`, or `xhigh` |
+| `logging.level` | No | `info` | Controls tracing output. | `EnvFilter` directives |
 
 Example:
 
-```env
-OPENAI_API_KEY=your-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-5.5
-OPENAI_API_TYPE=completions
-OPENAI_REASONING_EFFORT=medium
+```toml
+[provider.openai]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.5"
+api_type = "completions"
+reasoning_effort = "medium"
+
+[logging]
+level = "info"
 ```
 
 ## Testing Procedures
@@ -58,6 +63,7 @@ cargo test
 ```bash
 cargo test -p provider
 cargo test -p agent-core
+cargo test -p agent-config
 cargo test -p agent-cli
 ```
 
@@ -69,9 +75,9 @@ cargo run -p agent-cli
 
 Recommended manual checks:
 
-- Verify startup succeeds when all required environment variables are present.
-- Verify startup fails clearly when `OPENAI_API_KEY` is missing.
-- Verify both `OPENAI_API_TYPE=completions` and `OPENAI_API_TYPE=responses` work against a compatible endpoint.
+- Verify startup succeeds with a valid `~/.mini-agent/config.toml`.
+- Verify startup fails clearly when the configuration file or `provider.openai.api_key` is missing.
+- Verify both `provider.openai.api_type = "completions"` and `provider.openai.api_type = "responses"` work against a compatible endpoint.
 - Verify failed streaming responses do not append incomplete assistant messages to session history.
 
 ## Notes

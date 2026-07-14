@@ -9,7 +9,7 @@ Current deployment model: local execution.
 ### Local startup
 
 1. Ensure Rust is installed.
-2. Configure environment variables or create a `.env` file.
+2. Create `~/.mini-agent/config.toml` with the provider and logging settings.
 3. Start the CLI:
 
 ```bash
@@ -22,7 +22,7 @@ cargo run -p agent-cli
 cargo build --release -p agent-cli
 ```
 
-The binary can then be distributed or launched from `target/release/agent-cli` in environments where the required variables are available.
+The binary can then be distributed or launched from `target/release/agent-cli` in environments where the required user configuration file is available.
 
 ## Monitoring and Alerts
 
@@ -32,12 +32,15 @@ Available observability today:
 
 - Terminal stdout for streamed assistant output.
 - Terminal stderr for request and stream failures.
-- `tracing_subscriber` with `RUST_LOG` / `RUST_LOG_STYLE` environment-based filtering.
+- `tracing_subscriber` with the `logging.level` value from `~/.mini-agent/config.toml`.
 
 Example:
 
-```bash
-RUST_LOG=info cargo run -p agent-cli
+The logging level is configured in TOML:
+
+```toml
+[logging]
+level = "info"
 ```
 
 If you need operational monitoring later, good next steps would be:
@@ -50,32 +53,39 @@ If you need operational monitoring later, good next steps would be:
 
 ## Common Issues and Fixes
 
-### `OPENAI_API_KEY is not set`
+### Configuration file is missing
 
-Cause: required API key is missing.
+Cause: `~/.mini-agent/config.toml` does not exist or is not readable.
 
 Fix:
 
-- export `OPENAI_API_KEY`, or
-- add it to a local `.env` file in the repository root.
+- create `~/.mini-agent/config.toml` using the configuration example in the README.
 
-### `OPENAI_API_TYPE must be one of: responses, completions`
+### `provider.openai.api_key is missing`
+
+Cause: the required API key is missing or blank.
+
+Fix:
+
+- set a non-empty `api_key` under `[provider.openai]`.
+
+### `provider.openai.api_type is invalid`
 
 Cause: unsupported API type was configured.
 
 Fix:
 
-- set `OPENAI_API_TYPE=completions`, or
-- set `OPENAI_API_TYPE=responses`.
+- set `api_type = "completions"`, or
+- set `api_type = "responses"`.
 
-### `OPENAI_REASONING_EFFORT must be one of: low, medium, high, xhigh`
+### `provider.openai.reasoning_effort is invalid`
 
 Cause: invalid reasoning effort value.
 
 Fix:
 
-- remove the variable, or
-- set one of the supported values.
+- remove the key, or
+- set one of `low`, `medium`, `high`, or `xhigh`.
 
 ### Provider API errors such as 401 or 500
 
@@ -83,9 +93,9 @@ Cause: invalid credentials, incompatible base URL, or upstream provider failure.
 
 Fix:
 
-- verify `OPENAI_API_KEY`,
-- verify `OPENAI_BASE_URL`,
-- verify the configured endpoint supports the selected `OPENAI_API_TYPE`,
+- verify `provider.openai.api_key`,
+- verify `provider.openai.base_url`,
+- verify the configured endpoint supports the selected `provider.openai.api_type`,
 - retry after upstream service recovery.
 
 ### Streaming starts but ends with `Stream failed`
@@ -116,7 +126,7 @@ cargo run -p agent-cli
 ### Binary rollback
 
 - keep a previously validated release binary,
-- restore the previous environment configuration if it changed,
+- verify the corresponding `~/.mini-agent/config.toml` for the selected binary version,
 - rerun smoke checks against the provider endpoint.
 
 ## Operational Gaps

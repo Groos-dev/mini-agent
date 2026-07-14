@@ -7,6 +7,7 @@
 | Path | Crate | Purpose |
 | --- | --- | --- |
 | `crates/agent-cli` | `agent-cli` | Interactive terminal application that loads configuration, reads user input, streams assistant output, and maintains a session loop. |
+| `crates/agent-config` | `agent-config` | User-scoped TOML configuration discovery, parsing, defaulting, validation, and secret redaction. |
 | `crates/agent-core` | `agent-core` | Provider-agnostic agent state, message history, and chat request orchestration. |
 | `crates/provider` | `provider` | Provider trait and OpenAI-compatible streaming implementations for Chat Completions and Responses APIs. |
 
@@ -27,25 +28,31 @@
 
 ## Configuration
 
-The CLI loads environment variables directly and also supports a local `.env` file through `dotenvy`.
+The CLI loads configuration from `~/.mini-agent/config.toml`. It does not read
+`.env` files or use process environment variables as configuration overrides.
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `OPENAI_API_KEY` | Yes | None | Bearer token used for provider requests. |
-| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | Base URL for the OpenAI-compatible API. Do not include endpoint paths such as `/chat/completions`. |
-| `OPENAI_MODEL` | No | `gpt-5.5` | Model name sent to the provider. |
-| `OPENAI_API_TYPE` | No | `completions` | Streaming API variant. Supported values: `completions`, `responses`. |
-| `OPENAI_REASONING_EFFORT` | No | Empty | Optional reasoning effort. Supported values: `low`, `medium`, `high`, `xhigh`. Blank values are ignored. |
+The configuration file must contain a non-empty API key:
 
-Example `.env`:
+```toml
+[provider.openai]
+api_key = "your-api-key"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.5"
+api_type = "completions"
+reasoning_effort = "medium"
 
-```env
-OPENAI_API_KEY=your-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-5.5
-OPENAI_API_TYPE=completions
-OPENAI_REASONING_EFFORT=medium
+[logging]
+level = "info"
 ```
+
+| TOML key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `provider.openai.api_key` | Yes | None | Bearer token used for provider requests. |
+| `provider.openai.base_url` | No | `https://api.openai.com/v1` | Base URL for the OpenAI-compatible API. Do not include endpoint paths such as `/chat/completions`. |
+| `provider.openai.model` | No | `gpt-5.5` | Model name sent to the provider. |
+| `provider.openai.api_type` | No | `completions` | Streaming API variant. Supported values: `completions`, `responses`. |
+| `provider.openai.reasoning_effort` | No | None | Optional reasoning effort. Supported values: `low`, `medium`, `high`, `xhigh`. |
+| `logging.level` | No | `info` | `tracing-subscriber` filter directives. |
 
 ## Usage
 
@@ -83,7 +90,7 @@ cargo test -p agent-cli
 
 The workspace keeps provider-specific behavior out of the core agent loop:
 
-1. `agent-cli` reads terminal input and environment configuration.
+1. `agent-cli` loads the user TOML configuration and reads terminal input.
 2. `agent-core` builds provider-neutral chat requests from session history.
 3. `provider` sends requests to the configured OpenAI-compatible endpoint and returns a stream of text chunks.
 4. `agent-cli` prints streamed chunks and commits the assistant message to history only after the stream completes successfully.

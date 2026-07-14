@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-agent-core = {path = "../agent-core"}
+agent-config = { path = "../agent-config" }
+agent-core = { path = "../agent-core" }
 agent-protocol = { path = "../agent-protocol" }
 openai-provider = { path = "../provider" }
 tokio = {version = "1", features = ["full"]}
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
-dotenvy = "0.15"
 futures = "0.3"
