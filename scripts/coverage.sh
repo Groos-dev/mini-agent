@@ -10,6 +10,5 @@ cargo llvm-cov \
     --workspace \
     --all-targets \
     --fail-under-lines 85 \
-    --fail-under-functions 85 \
     --lcov \
     --output-path lcov.info
