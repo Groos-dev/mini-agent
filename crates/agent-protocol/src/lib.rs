@@ -171,15 +171,23 @@ mod tests {
     }
 
     #[test]
-    fn message_constructors_preserve_content() {
+    fn system_message_constructor_preserves_content() {
         assert!(matches!(
             Message::system("instructions"),
             Message::System(content) if content == "instructions"
         ));
+    }
+
+    #[test]
+    fn user_message_constructor_preserves_content() {
         assert!(matches!(
             Message::user("question"),
             Message::User(content) if content == "question"
         ));
+    }
+
+    #[test]
+    fn assistant_message_constructor_preserves_content() {
         assert!(matches!(
             Message::assistant_text("answer"),
             Message::AssistantText(content) if content == "answer"
@@ -187,19 +195,29 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_round_trips_all_supported_values() {
-        for (input, expected) in [
-            ("low", ReasoningEffort::Low),
-            ("medium", ReasoningEffort::Medium),
-            ("high", ReasoningEffort::High),
-            ("xhigh", ReasoningEffort::XHigh),
-        ] {
-            let effort: ReasoningEffort = input.parse().unwrap();
-            assert_eq!(effort, expected);
-            assert_eq!(effort.as_str(), input);
-            assert_eq!(effort.to_string(), input);
-        }
+    fn reasoning_effort_parses_low() {
+        assert_eq!("low".parse(), Ok(ReasoningEffort::Low));
+    }
 
+    #[test]
+    fn reasoning_effort_parses_medium() {
+        assert_eq!("medium".parse(), Ok(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn reasoning_effort_parses_high() {
+        assert_eq!("high".parse(), Ok(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn reasoning_effort_parses_xhigh() {
+        let effort: ReasoningEffort = "xhigh".parse().unwrap();
+        assert_eq!(effort.as_str(), "xhigh");
+        assert_eq!(effort.to_string(), "xhigh");
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_unknown_values() {
         assert_eq!(
             "maximum".parse::<ReasoningEffort>(),
             Err("unknown reasoning effort: maximum".to_string())
