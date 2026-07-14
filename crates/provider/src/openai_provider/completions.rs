@@ -72,6 +72,14 @@ struct OpenAIFunctionTool {
     parameters: serde_json::Value,
 }
 
+/// Partial representation of a Chat Completions SSE payload.
+///
+/// A streamed chunk also carries request metadata (`id`, `object`, `created`,
+/// and `model`) and may contain a final `usage`-only chunk with no choices.
+/// The stream adapter only needs `choices`, so Serde intentionally ignores the
+/// remaining fields. Within a choice, `index` and `delta.role` are likewise
+/// transport metadata: the former is not needed for text, and the latter is
+/// commonly emitted in the first empty content chunk.
 #[derive(Deserialize)]
 struct CompletionsStreamChunk {
     choices: Vec<CompletionsStreamChoice>,
@@ -126,7 +134,9 @@ impl ToolCallAccumulator {
         let mut name = None;
         let mut arguments_delta = None;
         if let Some(function) = delta.function {
-            if let Some(function_name) = function.name {
+            // Providers may send an empty name in later argument chunks. Keep the
+            // non-empty name from the first chunk so the completed call remains executable.
+            if let Some(function_name) = function.name.filter(|name| !name.is_empty()) {
                 entry.name = Some(function_name.clone());
                 name = Some(function_name);
             }
@@ -252,10 +262,19 @@ impl OpenAIProvider {
                             return;
                         }
                         raw_response.push(data.to_string());
+                        // Chat Completions event lifecycle:
+                        //
+                        // 1. The first chunk commonly contains only `delta.role = "assistant"`.
+                        //    It establishes the provider role and produces no local model event.
+                        // 2. Content and tool-call deltas are streamed immediately for live output.
+                        // 3. A choice with `finish_reason` finalizes the accumulated assistant
+                        //    text and/or tool calls, then emits `ResponseCompleted`.
+                        // 4. Some providers send a final usage-only chunk (`choices: []`), which
+                        //    is intentionally ignored before the `[DONE]` stream terminator.
                         match serde_json::from_str::<CompletionsStreamChunk>(data) {
                             Ok(parsed) => {
                                 for choice in parsed.choices {
-                                    if let Some(content) = choice.delta.content {
+                                    if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                                         assistant_text.push_str(&content);
                                         yield Ok(ModelEvent::AssistantTextDelta(content));
                                     }
@@ -507,6 +526,48 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn completions_stream_preserves_tool_name_across_empty_name_deltas() {
+        let server = mock_completions(
+            r#"data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_88be7b4de1614c76d3d2b1b8","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"command\":\"date"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"\",\"cwd\":\".\",\"timeout_ms\":1000}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-6c3c952d99e37a508a848e8b","object":"chat.completion.chunk","created":1783957026,"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":108,"completion_tokens":27,"total_tokens":135}}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = collect_events(
+            provider(server.uri())
+                .chat_stream_completions(messages(), vec![shell_spec()], None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ModelEvent::ToolCallDelta(_),
+                ModelEvent::ToolCallDelta(_),
+                ModelEvent::ToolCallDelta(_),
+                ModelEvent::ToolCallRequestReady(call),
+                ModelEvent::ResponseCompleted,
+            ] if call.id == "call_88be7b4de1614c76d3d2b1b8"
+                && call.name == "shell"
+                && call.arguments == r#"{"command":"date","cwd":".","timeout_ms":1000}"#
+        ));
+    }
+
+    #[tokio::test]
     async fn completions_stream_emits_common_message_and_completion_events() {
         let server = mock_completions(
             r#"data: {"choices":[{"delta":{"content":"Done."}}]}
@@ -533,6 +594,53 @@ data: [DONE]
                 ModelEvent::AssistantMessageDone(message),
                 ModelEvent::ResponseCompleted,
             ] if text == "Done." && message == "Done."
+        ));
+    }
+
+    #[tokio::test]
+    async fn completions_stream_handles_observed_provider_event_sequence() {
+        let server = mock_completions(
+            r#"data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"com"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"plet"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"ions"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":" probe"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-8612c59bbff965d73bddc492","object":"chat.completion.chunk","created":1783956468,"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":8,"total_tokens":108}}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = collect_events(
+            provider(server.uri())
+                .chat_stream_completions(messages(), Vec::new(), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ModelEvent::AssistantTextDelta(first),
+                ModelEvent::AssistantTextDelta(second),
+                ModelEvent::AssistantTextDelta(third),
+                ModelEvent::AssistantTextDelta(fourth),
+                ModelEvent::AssistantMessageDone(message),
+                ModelEvent::ResponseCompleted,
+            ] if first == "com"
+                && second == "plet"
+                && third == "ions"
+                && fourth == " probe"
+                && message == "completions probe"
         ));
     }
 
