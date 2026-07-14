@@ -39,6 +39,12 @@ struct ResponsesFunctionTool {
     parameters: Value,
 }
 
+/// Partial representation of a Responses SSE payload.
+///
+/// The API includes transport and ordering metadata such as `sequence_number`,
+/// `item_id`, and `content_index`. This adapter does not need them to construct
+/// model events, so Serde intentionally ignores them while retaining only the
+/// fields used by the stream state machine below.
 #[derive(Deserialize)]
 struct ResponsesStreamEvent {
     #[serde(rename = "type")]
@@ -176,6 +182,16 @@ impl OpenAIProvider {
                         }
                     };
 
+                    // Responses event lifecycle:
+                    //
+                    // 1. `response.created`, `response.output_item.added`, and
+                    //    `response.content_part.*` describe transport or item lifecycle only.
+                    // 2. `response.output_text.delta` and
+                    //    `response.function_call_arguments.delta` provide live output.
+                    // 3. `*.done` and `response.output_item.done` provide authoritative,
+                    //    complete output used to update conversation history.
+                    // 4. `response.completed` confirms the response has finished; `[DONE]`
+                    //    then closes the SSE stream.
                     match event.event_type.as_str() {
                         "response.output_text.delta" => {
                             let output_index = match required_output_index(&event) {
@@ -254,6 +270,8 @@ impl OpenAIProvider {
                             )));
                             return;
                         }
+                        // Ordering and lifecycle metadata is intentionally ignored. The raw
+                        // payload remains available in the completion debug log for diagnosis.
                         _ => {}
                     }
                 }
@@ -541,6 +559,118 @@ data: [DONE]
         ));
         assert!(matches!(events[4], ModelEvent::ResponseCompleted));
         assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_handles_observed_tool_call_sequence() {
+        let server = mock_responses(
+            r#"data: {"type":"response.created","response":{"id":"chatcmpl-247e4dc0f8e0996254b724c3","object":"response","model":"gpt-5.5","status":"in_progress","output":[]}}
+
+data: {"item":{"arguments":"","call_id":"call_1c4a8f006a2a9bbbb78bc3f5","id":"item_5731e2763310419c49ae0a8e","name":"shell","status":"in_progress","type":"function_call"},"output_index":0,"sequence_number":1,"type":"response.output_item.added"}
+
+data: {"call_id":"call_1c4a8f006a2a9bbbb78bc3f5","delta":"{\"command\":\"date","item_id":"item_5731e2763310419c49ae0a8e","name":"shell","output_index":0,"sequence_number":2,"type":"response.function_call_arguments.delta"}
+
+data: {"call_id":"call_1c4a8f006a2a9bbbb78bc3f5","delta":"\",\"cwd\":\".\",\"timeout_ms\":1000}","item_id":"item_5731e2763310419c49ae0a8e","name":"shell","output_index":0,"sequence_number":3,"type":"response.function_call_arguments.delta"}
+
+data: {"arguments":"{\"command\":\"date\",\"cwd\":\".\",\"timeout_ms\":1000}","call_id":"call_1c4a8f006a2a9bbbb78bc3f5","item_id":"item_5731e2763310419c49ae0a8e","name":"shell","output_index":0,"sequence_number":17,"type":"response.function_call_arguments.done"}
+
+data: {"item":{"arguments":"{\"command\":\"date\",\"cwd\":\".\",\"timeout_ms\":1000}","call_id":"call_1c4a8f006a2a9bbbb78bc3f5","id":"item_5731e2763310419c49ae0a8e","name":"shell","status":"completed","type":"function_call"},"output_index":0,"sequence_number":18,"type":"response.output_item.done"}
+
+data: {"type":"response.completed","response":{"id":"chatcmpl-247e4dc0f8e0996254b724c3","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"function_call","id":"item_2e0aab2ed40857d90f6ccfa3","status":"completed","call_id":"call_1c4a8f006a2a9bbbb78bc3f5","name":"shell","arguments":"{\"command\":\"date\",\"cwd\":\".\",\"timeout_ms\":1000}"}],"usage":{"input_tokens":4488,"output_tokens":27,"total_tokens":4515}},"sequence_number":19}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = collect_events(
+            provider(server.uri())
+                .chat_stream_response(messages(), vec![shell_spec()], None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ModelEvent::ToolCallDelta(_),
+                ModelEvent::ToolCallDelta(_),
+                ModelEvent::ToolCallRequestReady(call),
+                ModelEvent::ResponseCompleted,
+            ] if call.id == "call_1c4a8f006a2a9bbbb78bc3f5"
+                && call.name == "shell"
+                && call.arguments == r#"{"command":"date","cwd":".","timeout_ms":1000}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_handles_observed_provider_event_sequence() {
+        let server = mock_responses(
+            r#"data: {"type":"response.created","response":{"id":"chatcmpl-2afb352ee44a653c1abc9361","object":"response","model":"gpt-5.5","status":"in_progress","output":[]}}
+
+data: {"item":{"content":[{"text":"","type":"output_text"}],"id":"item_d961fbc8a9f734839011abd1","role":"assistant","status":"in_progress","type":"message"},"output_index":0,"sequence_number":1,"type":"response.output_item.added"}
+
+data: {"content_index":0,"item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"part":{"annotations":[],"logprobs":[],"text":"","type":"output_text"},"sequence_number":2,"type":"response.content_part.added"}
+
+data: {"content_index":0,"delta":"Hi","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":3,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":".","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":4,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" What","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":5,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" would","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":6,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" you","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":7,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" like","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":8,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" to","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":9,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" work","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":10,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":" on","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":11,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"delta":"?","item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":12,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"sequence_number":13,"text":"Hi. What would you like to work on?","type":"response.output_text.done"}
+
+data: {"content_index":0,"item_id":"item_d961fbc8a9f734839011abd1","output_index":0,"part":{"annotations":[],"logprobs":[],"text":"Hi. What would you like to work on?","type":"output_text"},"sequence_number":14,"type":"response.content_part.done"}
+
+data: {"item":{"content":[{"text":"Hi. What would you like to work on?","type":"output_text"}],"id":"item_d961fbc8a9f734839011abd1","role":"assistant","status":"completed","type":"message"},"output_index":0,"sequence_number":15,"type":"response.output_item.done"}
+
+data: {"type":"response.completed","response":{"id":"chatcmpl-2afb352ee44a653c1abc9361","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","id":"item_d961fbc8a9f734839011abd1","role":"assistant","content":[{"type":"output_text","text":"Hi. What would you like to work on?"}],"status":"completed"}],"usage":{"input_tokens":4474,"output_tokens":14,"total_tokens":4488}},"sequence_number":16}
+
+data: [DONE]
+"#,
+        )
+        .await;
+
+        let events = collect_events(
+            provider(server.uri())
+                .chat_stream_response(messages(), Vec::new(), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let streamed_text = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::AssistantTextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed_text, "Hi. What would you like to work on?");
+        assert!(matches!(
+            events.get(10),
+            Some(ModelEvent::AssistantMessageDone(text)) if text == "Hi. What would you like to work on?"
+        ));
+        assert!(matches!(
+            events.get(11),
+            Some(ModelEvent::ResponseCompleted)
+        ));
+        assert_eq!(events.len(), 12);
     }
 
     #[tokio::test]

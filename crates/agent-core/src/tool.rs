@@ -165,6 +165,18 @@ mod tests {
     async fn registry_rejects_duplicate_names_and_reports_unknown_tools() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(TestTool)).unwrap();
+        assert_eq!(registry.specs()[0].name, "test");
+
+        let result = registry
+            .execute(
+                "test",
+                serde_json::json!({}),
+                &ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.content, "ok");
 
         let duplicate = registry.register(Box::new(TestTool)).unwrap_err();
         assert!(matches!(duplicate, ToolError::InvalidInput(_)));
@@ -178,5 +190,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(missing, ToolError::UnknownTool(name) if name == "missing"));
+    }
+
+    #[test]
+    fn tool_results_record_status_and_metadata() {
+        let success = ToolResult::success("ok").with_metadata(serde_json::json!({"elapsed_ms": 1}));
+        assert!(success.success);
+        assert_eq!(success.content, "ok");
+        assert_eq!(success.metadata, serde_json::json!({"elapsed_ms": 1}));
+
+        let failure = ToolResult::failure("failed");
+        assert!(!failure.success);
+        assert_eq!(failure.content, "failed");
+        assert_eq!(failure.metadata, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn default_execution_context_has_conservative_limits() {
+        let context = ToolExecutionContext::default();
+        assert_eq!(context.timeout, Duration::from_secs(30));
+        assert_eq!(context.max_stdout_bytes, 64 * 1024);
+        assert_eq!(context.max_stderr_bytes, 64 * 1024);
     }
 }

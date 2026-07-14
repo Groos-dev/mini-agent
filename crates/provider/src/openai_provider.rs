@@ -106,6 +106,16 @@ mod tests {
         assert_eq!(provider.base_url, "https://example.test/v1");
     }
 
+    #[test]
+    fn api_type_parses_supported_values_case_insensitively() {
+        assert_eq!("responses".parse(), Ok(ApiType::Responses));
+        assert_eq!("COMPLETIONS".parse(), Ok(ApiType::Completions));
+        assert_eq!(
+            "unsupported".parse::<ApiType>(),
+            Err("unknown API type: unsupported".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn chat_stream_dispatches_to_completions_endpoint() {
         let server = MockServer::start().await;

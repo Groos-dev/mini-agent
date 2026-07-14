@@ -169,4 +169,40 @@ mod tests {
                 if tool_call_id == "call_1" && content == "ok"
         ));
     }
+
+    #[test]
+    fn message_constructors_preserve_content() {
+        assert!(matches!(
+            Message::system("instructions"),
+            Message::System(content) if content == "instructions"
+        ));
+        assert!(matches!(
+            Message::user("question"),
+            Message::User(content) if content == "question"
+        ));
+        assert!(matches!(
+            Message::assistant_text("answer"),
+            Message::AssistantText(content) if content == "answer"
+        ));
+    }
+
+    #[test]
+    fn reasoning_effort_round_trips_all_supported_values() {
+        for (input, expected) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+        ] {
+            let effort: ReasoningEffort = input.parse().unwrap();
+            assert_eq!(effort, expected);
+            assert_eq!(effort.as_str(), input);
+            assert_eq!(effort.to_string(), input);
+        }
+
+        assert_eq!(
+            "maximum".parse::<ReasoningEffort>(),
+            Err("unknown reasoning effort: maximum".to_string())
+        );
+    }
 }
