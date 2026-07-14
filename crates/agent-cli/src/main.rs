@@ -1,14 +1,12 @@
-use std::{
-    io::{self, BufRead, Write},
-    str::FromStr,
-};
+use std::io::{self, BufRead, Write};
 
+use agent_config::{
+    ApiType as ConfigApiType, AppConfig, ProviderConfig,
+    ReasoningEffort as ConfigReasoningEffort,
+};
 use agent_core::{
     agent::{Agent, AgentEvent, AgentRunOptions},
-    tool::{
-        ToolRegistry,
-        shell::{ShellTool, ShellToolConfig},
-    },
+    tool::{shell::{ShellTool, ShellToolConfig}, ToolRegistry},
 };
 use agent_protocol::{ModelOptions, ReasoningEffort};
 use futures::StreamExt;
@@ -16,17 +14,16 @@ use openai_provider::{ApiType, OpenAIProvider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    let config = AppConfig::load_default()?;
+    init_tracing(&config.logging.level)?;
 
-    init_tracing();
-    let config = load_config();
-
-    let session_options = SessionOptions::from_config(&config);
+    let provider_config = &config.provider;
+    let session_options = SessionOptions::from_config(provider_config);
     let provider = OpenAIProvider::new(
-        config.api_key.clone(),
-        config.base_url.clone(),
-        config.model.clone(),
-        config.api_type,
+        provider_config.api_key.clone(),
+        provider_config.base_url.clone(),
+        provider_config.model.clone(),
+        map_api_type(provider_config.api_type),
     );
     let tool_registry = build_tool_registry()?;
     let mut agent = Agent::new(Box::new(provider), tool_registry);
@@ -99,22 +96,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct Config {
-    api_key: String,
-    base_url: String,
-    model: String,
-    api_type: ApiType,
-    reasoning_effort: Option<ReasoningEffort>,
-}
-
 struct SessionOptions {
     reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl SessionOptions {
-    fn from_config(config: &Config) -> Self {
+    fn from_config(config: &ProviderConfig) -> Self {
         Self {
-            reasoning_effort: config.reasoning_effort,
+            reasoning_effort: config.reasoning_effort.map(map_reasoning_effort),
         }
     }
 
@@ -129,8 +118,20 @@ impl SessionOptions {
     }
 }
 
-fn load_config() -> Config {
-    load_config_from_env(|key| std::env::var(key).ok())
+fn map_api_type(api_type: ConfigApiType) -> ApiType {
+    match api_type {
+        ConfigApiType::Completions => ApiType::Completions,
+        ConfigApiType::Responses => ApiType::Responses,
+    }
+}
+
+fn map_reasoning_effort(effort: ConfigReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ConfigReasoningEffort::Low => ReasoningEffort::Low,
+        ConfigReasoningEffort::Medium => ReasoningEffort::Medium,
+        ConfigReasoningEffort::High => ReasoningEffort::High,
+        ConfigReasoningEffort::XHigh => ReasoningEffort::XHigh,
+    }
 }
 
 fn read_input_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
@@ -141,47 +142,17 @@ fn read_input_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-fn load_config_from_env<F>(get: F) -> Config
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let api_key = get("OPENAI_API_KEY").expect("OPENAI_API_KEY is not set");
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        panic!("OPENAI_API_KEY must not be empty");
-    }
-    let base_url = get("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".into());
-    let model = get("OPENAI_MODEL").unwrap_or_else(|| "gpt-5.5".to_string());
-    let api_type = get("OPENAI_API_TYPE")
-        .unwrap_or_else(|| "completions".to_string())
-        .parse()
-        .expect("OPENAI_API_TYPE must be one of: responses, completions");
-    let reasoning_effort = get("OPENAI_REASONING_EFFORT")
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| ReasoningEffort::from_str(v.trim()))
-        .transpose()
-        .expect("OPENAI_REASONING_EFFORT must be one of: low, medium, high, xhigh");
-    Config {
-        api_key,
-        base_url,
-        model,
-        api_type,
-        reasoning_effort,
-    }
-}
-
 fn build_tool_registry() -> anyhow::Result<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ShellTool::new(ShellToolConfig::default())))?;
     Ok(registry)
 }
 
-fn init_tracing() {
+fn init_tracing(level: &str) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(level)?)
         .init();
+    Ok(())
 }
 
 fn print_welcome() {
@@ -190,7 +161,7 @@ fn print_welcome() {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Cursor};
+    use std::io::Cursor;
 
     use super::*;
 
@@ -205,101 +176,18 @@ mod tests {
         assert_eq!(read_input_line(&mut input).unwrap(), None);
     }
 
-    fn config_from(values: &[(&str, &str)]) -> Config {
-        let env: HashMap<&str, &str> = values.iter().copied().collect();
-        load_config_from_env(|key| env.get(key).map(|value| (*value).to_string()))
-    }
-
-    #[test]
-    fn load_config_uses_required_api_key_and_defaults() {
-        let config = config_from(&[("OPENAI_API_KEY", "key")]);
-
-        assert_eq!(config.api_key, "key");
-        assert_eq!(config.base_url, "https://api.openai.com/v1");
-        assert_eq!(config.model, "gpt-5.5");
-        assert_eq!(config.api_type, ApiType::Completions);
-        assert_eq!(config.reasoning_effort, None);
-    }
-
-    #[test]
-    fn load_config_reads_provider_settings() {
-        let config = config_from(&[
-            ("OPENAI_API_KEY", "key"),
-            ("OPENAI_BASE_URL", "https://example.test/v1"),
-            ("OPENAI_MODEL", "custom-model"),
-            ("OPENAI_API_TYPE", "responses"),
-        ]);
-
-        assert_eq!(config.base_url, "https://example.test/v1");
-        assert_eq!(config.model, "custom-model");
-        assert_eq!(config.api_type, ApiType::Responses);
-    }
-
-    #[test]
-    fn load_config_parses_reasoning_effort() {
-        let config = config_from(&[
-            ("OPENAI_API_KEY", "key"),
-            ("OPENAI_REASONING_EFFORT", "high"),
-        ]);
-
-        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
-    }
-
-    #[test]
-    fn load_config_treats_blank_reasoning_effort_as_none() {
-        let config = config_from(&[
-            ("OPENAI_API_KEY", "key"),
-            ("OPENAI_REASONING_EFFORT", "   "),
-        ]);
-
-        assert_eq!(config.reasoning_effort, None);
-    }
-
-    #[test]
-    #[should_panic(expected = "OPENAI_API_KEY is not set")]
-    fn load_config_panics_without_api_key() {
-        let _ = config_from(&[]);
-    }
-
-    #[test]
-    #[should_panic(expected = "OPENAI_API_KEY must not be empty")]
-    fn load_config_panics_for_blank_api_key() {
-        let _ = config_from(&[("OPENAI_API_KEY", "  ")]);
-    }
-
-    #[test]
-    #[should_panic(expected = "OPENAI_REASONING_EFFORT must be one of")]
-    fn load_config_panics_for_invalid_reasoning_effort() {
-        let _ = config_from(&[
-            ("OPENAI_API_KEY", "key"),
-            ("OPENAI_REASONING_EFFORT", "minimal"),
-        ]);
-    }
-
-    #[test]
-    #[should_panic(expected = "OPENAI_API_TYPE must be one of")]
-    fn load_config_panics_for_invalid_api_type() {
-        let _ = config_from(&[("OPENAI_API_KEY", "key"), ("OPENAI_API_TYPE", "chat")]);
-    }
-
     #[test]
     fn build_tool_registry_registers_shell_tool() {
         assert_eq!(build_tool_registry().unwrap().specs()[0].name, "shell");
     }
 
     #[test]
-    fn session_options_from_config_copies_reasoning_effort() {
-        let config = Config {
-            api_key: "key".to_string(),
-            base_url: "https://example.test/v1".to_string(),
-            model: "model".to_string(),
-            api_type: ApiType::Completions,
-            reasoning_effort: Some(ReasoningEffort::Medium),
-        };
-
-        let options = SessionOptions::from_config(&config);
-
-        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::Medium));
+    fn maps_config_values_to_protocol_values() {
+        assert_eq!(map_api_type(ConfigApiType::Responses), ApiType::Responses);
+        assert_eq!(
+            map_reasoning_effort(ConfigReasoningEffort::Medium),
+            ReasoningEffort::Medium
+        );
     }
 
     #[test]
