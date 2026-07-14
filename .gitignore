@@ -2,13 +2,5 @@
 .env
 /.llvm-cov/
 /lcov.info
-/docs/TOOL_DESIGN.md
 .omx/
 /.idea/
-<<<<<<< HEAD
-/.llvm-cov/
-/lcov.info
-=======
-.omx/
-/.idea/
->>>>>>> e71e023 (feat: add shell tool support)
