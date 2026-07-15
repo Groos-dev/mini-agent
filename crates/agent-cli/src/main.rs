@@ -1,12 +1,14 @@
 use std::io::{self, BufRead, Write};
 
 use agent_config::{
-    ApiType as ConfigApiType, AppConfig, ProviderConfig,
-    ReasoningEffort as ConfigReasoningEffort,
+    ApiType as ConfigApiType, AppConfig, ProviderConfig, ReasoningEffort as ConfigReasoningEffort,
 };
 use agent_core::{
     agent::{Agent, AgentEvent, AgentRunOptions},
-    tool::{shell::{ShellTool, ShellToolConfig}, ToolRegistry},
+    tool::{
+        ToolRegistry,
+        shell::{ShellTool, ShellToolConfig},
+    },
 };
 use agent_protocol::{ModelOptions, ReasoningEffort};
 use futures::StreamExt;

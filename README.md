@@ -34,7 +34,7 @@ The CLI loads configuration from `~/.mini-agent/config.toml`. It does not read
 The configuration file must contain a non-empty API key:
 
 ```toml
-[provider.openai]
+[provider]
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5.5"
@@ -47,11 +47,11 @@ level = "info"
 
 | TOML key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `provider.openai.api_key` | Yes | None | Bearer token used for provider requests. |
-| `provider.openai.base_url` | No | `https://api.openai.com/v1` | Base URL for the OpenAI-compatible API. Do not include endpoint paths such as `/chat/completions`. |
-| `provider.openai.model` | No | `gpt-5.5` | Model name sent to the provider. |
-| `provider.openai.api_type` | No | `completions` | Streaming API variant. Supported values: `completions`, `responses`. |
-| `provider.openai.reasoning_effort` | No | None | Optional reasoning effort. Supported values: `low`, `medium`, `high`, `xhigh`. |
+| `provider.api_key` | Yes | None | Bearer token used for provider requests. |
+| `provider.base_url` | No | `https://api.openai.com/v1` | Base URL for the OpenAI-compatible API. Do not include endpoint paths such as `/chat/completions`. |
+| `provider.model` | No | `gpt-5.5` | Model name sent to the provider. |
+| `provider.api_type` | No | `completions` | Streaming API variant. Supported values: `completions`, `responses`. |
+| `provider.reasoning_effort` | No | None | Optional reasoning effort. Supported values: `low`, `medium`, `high`, `xhigh`. |
 | `logging.level` | No | `info` | `tracing-subscriber` filter directives. |
 
 ## Usage

@@ -61,15 +61,15 @@ Fix:
 
 - create `~/.mini-agent/config.toml` using the configuration example in the README.
 
-### `provider.openai.api_key is missing`
+### `provider.api_key is missing`
 
 Cause: the required API key is missing or blank.
 
 Fix:
 
-- set a non-empty `api_key` under `[provider.openai]`.
+- set a non-empty `api_key` under `[provider]`.
 
-### `provider.openai.api_type is invalid`
+### `provider.api_type is invalid`
 
 Cause: unsupported API type was configured.
 
@@ -78,7 +78,7 @@ Fix:
 - set `api_type = "completions"`, or
 - set `api_type = "responses"`.
 
-### `provider.openai.reasoning_effort is invalid`
+### `provider.reasoning_effort is invalid`
 
 Cause: invalid reasoning effort value.
 
@@ -93,9 +93,9 @@ Cause: invalid credentials, incompatible base URL, or upstream provider failure.
 
 Fix:
 
-- verify `provider.openai.api_key`,
-- verify `provider.openai.base_url`,
-- verify the configured endpoint supports the selected `provider.openai.api_type`,
+- verify `provider.api_key`,
+- verify `provider.base_url`,
+- verify the configured endpoint supports the selected `provider.api_type`,
 - retry after upstream service recovery.
 
 ### Streaming starts but ends with `Stream failed`

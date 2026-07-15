@@ -29,17 +29,17 @@ The CLI reads configuration only from `~/.mini-agent/config.toml`. This task doe
 
 | TOML key | Required | Default | Purpose | Format |
 | --- | --- | --- | --- | --- |
-| `provider.openai.api_key` | Yes | None | Authenticates requests to the configured provider. | Non-empty string |
-| `provider.openai.base_url` | No | `https://api.openai.com/v1` | Overrides the provider base URL. | Absolute HTTP(S) URL without endpoint suffix |
-| `provider.openai.model` | No | `gpt-5.5` | Selects the target model. | Model id string |
-| `provider.openai.api_type` | No | `completions` | Selects which streaming API contract to use. | `completions` or `responses` |
-| `provider.openai.reasoning_effort` | No | None | Enables provider reasoning effort when supported. | `low`, `medium`, `high`, or `xhigh` |
+| `provider.api_key` | Yes | None | Authenticates requests to the configured provider. | Non-empty string |
+| `provider.base_url` | No | `https://api.openai.com/v1` | Overrides the provider base URL. | Absolute HTTP(S) URL without endpoint suffix |
+| `provider.model` | No | `gpt-5.5` | Selects the target model. | Model id string |
+| `provider.api_type` | No | `completions` | Selects which streaming API contract to use. | `completions` or `responses` |
+| `provider.reasoning_effort` | No | None | Enables provider reasoning effort when supported. | `low`, `medium`, `high`, or `xhigh` |
 | `logging.level` | No | `info` | Controls tracing output. | `EnvFilter` directives |
 
 Example:
 
 ```toml
-[provider.openai]
+[provider]
 api_key = "your-api-key"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5.5"
@@ -76,8 +76,8 @@ cargo run -p agent-cli
 Recommended manual checks:
 
 - Verify startup succeeds with a valid `~/.mini-agent/config.toml`.
-- Verify startup fails clearly when the configuration file or `provider.openai.api_key` is missing.
-- Verify both `provider.openai.api_type = "completions"` and `provider.openai.api_type = "responses"` work against a compatible endpoint.
+- Verify startup fails clearly when the configuration file or `provider.api_key` is missing.
+- Verify both `provider.api_type = "completions"` and `provider.api_type = "responses"` work against a compatible endpoint.
 - Verify failed streaming responses do not append incomplete assistant messages to session history.
 
 ## Notes
