@@ -13,6 +13,7 @@
 
 ## Features
 
+- Full-screen OpenCode-style terminal UI with a scrollable conversation and multi-line composer.
 - Streaming assistant responses in the terminal.
 - Multi-turn conversation history within a CLI session.
 - OpenAI-compatible provider abstraction.
@@ -65,8 +66,11 @@ cargo run -p agent-cli
 Inside the interactive session:
 
 - Type a prompt and press Enter to stream a response.
-- Type `exit` or `quit` to end the session.
-- Empty lines are ignored.
+- Press Shift+Enter to insert a newline in the composer.
+- Use PageUp/PageDown or Ctrl+U/Ctrl+D to scroll the message area.
+- Press Ctrl+C to exit; press `q` with an empty composer while idle to exit.
+- Press Esc to clear the current composer input.
+- Empty submissions are ignored.
 
 ## Development
 
