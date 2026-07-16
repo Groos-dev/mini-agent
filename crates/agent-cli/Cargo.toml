@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 agent-config = { path = "../agent-config" }
 agent-core = { path = "../agent-core" }
+agent-tui = { path = "../agent-tui" }
 agent-protocol = { path = "../agent-protocol" }
 openai-provider = { path = "../provider" }
 tokio = {version = "1", features = ["full"]}
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
-futures = "0.3"

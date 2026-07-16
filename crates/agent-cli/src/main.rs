@@ -1,17 +1,15 @@
-use std::io::{self, BufRead, Write};
-
 use agent_config::{
     ApiType as ConfigApiType, AppConfig, ProviderConfig, ReasoningEffort as ConfigReasoningEffort,
 };
 use agent_core::{
-    agent::{Agent, AgentEvent, AgentRunOptions},
+    agent::{Agent, AgentRunOptions},
     tool::{
         ToolRegistry,
         shell::{ShellTool, ShellToolConfig},
     },
 };
 use agent_protocol::{ModelOptions, ReasoningEffort};
-use futures::StreamExt;
+use agent_tui::{TuiMetadata, run};
 use openai_provider::{ApiType, OpenAIProvider};
 
 #[tokio::main]
@@ -28,73 +26,17 @@ async fn main() -> anyhow::Result<()> {
         map_api_type(provider_config.api_type),
     );
     let tool_registry = build_tool_registry()?;
-    let mut agent = Agent::new(Box::new(provider), tool_registry);
+    let agent = Agent::new(Box::new(provider), tool_registry);
 
-    print_welcome();
-
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-
-    loop {
-        print!("\nYou> ");
-        io::stdout().flush()?;
-
-        let Some(input) = read_input_line(&mut stdin)? else {
-            println!();
-            break;
-        };
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input == "exit" || input == "quit" {
-            break;
-        }
-
-        let options = session_options.agent_run_options();
-        let mut stream = match agent.run_stream(input, options).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                eprintln!("\nRequest failed: {err}");
-                continue;
-            }
-        };
-
-        print!("Assistant> ");
-        io::stdout().flush()?;
-
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(AgentEvent::TextChunk(piece)) => {
-                    print!("{piece}");
-                    io::stdout().flush()?;
-                }
-                Ok(AgentEvent::ToolCallStarted {
-                    name, arguments, ..
-                }) => {
-                    println!("\n[tool:{name}] started {arguments}");
-                    io::stdout().flush()?;
-                }
-                Ok(AgentEvent::ToolCallFinished { name, result, .. }) => {
-                    println!("\n[tool:{name}] finished success={}", result.success);
-                    io::stdout().flush()?;
-                }
-                Ok(AgentEvent::ToolCallFailed { name, error, .. }) => {
-                    println!("\n[tool:{name}] failed {error}");
-                    io::stdout().flush()?;
-                }
-                Ok(AgentEvent::TurnFinished) => {}
-                Err(err) => {
-                    eprintln!("\nStream failed: {err}");
-                    break;
-                }
-            }
-        }
-        println!();
-    }
-
-    println!("Bye.");
+    run(
+        agent,
+        session_options.agent_run_options(),
+        TuiMetadata::new(
+            provider_config.model.clone(),
+            api_type_label(provider_config.api_type),
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -127,6 +69,13 @@ fn map_api_type(api_type: ConfigApiType) -> ApiType {
     }
 }
 
+fn api_type_label(api_type: ConfigApiType) -> &'static str {
+    match api_type {
+        ConfigApiType::Completions => "completions",
+        ConfigApiType::Responses => "responses",
+    }
+}
+
 fn map_reasoning_effort(effort: ConfigReasoningEffort) -> ReasoningEffort {
     match effort {
         ConfigReasoningEffort::Low => ReasoningEffort::Low,
@@ -134,14 +83,6 @@ fn map_reasoning_effort(effort: ConfigReasoningEffort) -> ReasoningEffort {
         ConfigReasoningEffort::High => ReasoningEffort::High,
         ConfigReasoningEffort::XHigh => ReasoningEffort::XHigh,
     }
-}
-
-fn read_input_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
-    let mut bytes = Vec::new();
-    if input.read_until(b'\n', &mut bytes)? == 0 {
-        return Ok(None);
-    }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn build_tool_registry() -> anyhow::Result<ToolRegistry> {
@@ -157,26 +98,9 @@ fn init_tracing(level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_welcome() {
-    println!("mini-agent");
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
-
-    #[test]
-    fn read_input_line_replaces_invalid_utf8_without_failing() {
-        let mut input = Cursor::new(b"hello\xFF\n".to_vec());
-
-        assert_eq!(
-            read_input_line(&mut input).unwrap(),
-            Some("hello\u{FFFD}\n".to_string())
-        );
-        assert_eq!(read_input_line(&mut input).unwrap(), None);
-    }
 
     #[test]
     fn build_tool_registry_registers_shell_tool() {
@@ -186,6 +110,8 @@ mod tests {
     #[test]
     fn maps_config_values_to_protocol_values() {
         assert_eq!(map_api_type(ConfigApiType::Responses), ApiType::Responses);
+        assert_eq!(api_type_label(ConfigApiType::Completions), "completions");
+        assert_eq!(api_type_label(ConfigApiType::Responses), "responses");
         assert_eq!(
             map_reasoning_effort(ConfigReasoningEffort::Medium),
             ReasoningEffort::Medium

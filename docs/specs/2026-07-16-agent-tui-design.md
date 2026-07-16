@@ -45,9 +45,11 @@ provider, tool registry, and `Agent`. It passes those runtime dependencies to
 1. `AppState` stores the message list, composer buffer and cursor, scroll
    position, request state, and status metadata. It is deterministic and does
    not perform terminal I/O.
-2. The event loop reads terminal events, starts an agent stream for submitted
-   prompts, and forwards stream events to `AppState`. While a request is
-   active, terminal input remains responsive but cannot submit another prompt.
+2. A Tokio worker owns the `Agent`, receives submitted prompts through a
+   channel, and forwards stream events through a second channel. The event
+   loop reads terminal events and worker events together, so terminal input
+   remains responsive while a request is active and cannot submit another
+   prompt.
 3. The renderer converts `AppState` into ratatui widgets. It calculates the
    wrapped message height, preserves the user's manual scroll position, and
    renders the composer and footer without changing layout dimensions.
@@ -102,10 +104,11 @@ original hook. Setup, input, draw, and stream errors are returned as
 `anyhow::Result` from the runner; request failures are also shown in the
 message viewport so the session remains usable when possible.
 
-The active stream is polled from the same async event loop as terminal input
-with a short redraw interval. This keeps streamed text visible without blocking
-keypress handling. The runner exits when input reaches EOF, `Ctrl+c` is
-pressed, or the user selects `q` in the idle empty-composer state.
+The worker stream and terminal input are multiplexed by the same async event
+loop with a short redraw interval. This keeps streamed text visible without
+blocking keypress handling. The runner cancels the worker on exit. It exits
+when `Ctrl+c` is pressed or the user selects `q` in the idle empty-composer
+state.
 
 ## Testing
 
